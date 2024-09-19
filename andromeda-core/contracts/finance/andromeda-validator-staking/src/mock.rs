@@ -1,12 +1,13 @@
 use andromeda_finance::validator_staking::{ExecuteMsg, InstantiateMsg, QueryMsg, UnstakingTokens};
-use cosmwasm_std::{Addr, Coin, Delegation, Empty};
+use cosmwasm_std::{Addr, Coin, Delegation, Empty, Uint128};
 
 use crate::contract::{execute, instantiate, query, reply};
 use andromeda_testing::{
+    mock::MockApp,
     mock_ado,
     mock_contract::{ExecuteResult, MockADO, MockContract},
 };
-use cw_multi_test::{App, Contract, ContractWrapper};
+use cw_multi_test::{Contract, ContractWrapper};
 
 use andromeda_std::{amp::AndrAddr, error::ContractError};
 
@@ -16,7 +17,7 @@ mock_ado!(MockValidatorStaking, ExecuteMsg, QueryMsg);
 impl MockValidatorStaking {
     pub fn execute_stake(
         &self,
-        app: &mut App,
+        app: &mut MockApp,
         sender: Addr,
         validator: Option<Addr>,
         funds: Vec<Coin>,
@@ -27,33 +28,43 @@ impl MockValidatorStaking {
 
     pub fn execute_unstake(
         &self,
-        app: &mut App,
+        app: &mut MockApp,
         sender: Addr,
         validator: Option<Addr>,
+        amount: Option<Uint128>,
     ) -> ExecuteResult {
-        let msg = mock_execute_unstake(validator);
+        let msg = mock_execute_unstake(validator, amount);
         self.execute(app, &msg, sender, &[])
     }
 
     pub fn execute_claim_reward(
         &self,
-        app: &mut App,
+        app: &mut MockApp,
         sender: Addr,
         validator: Option<Addr>,
-        recipient: Option<AndrAddr>,
     ) -> ExecuteResult {
-        let msg = mock_execute_claim_reward(validator, recipient);
+        let msg = mock_execute_claim_reward(validator);
         self.execute(app, &msg, sender, &[])
     }
 
-    pub fn execute_withdraw_fund(&self, app: &mut App, sender: Addr) -> ExecuteResult {
-        let msg = mock_execute_withdraw_fund();
+    pub fn execute_withdraw_fund(&self, app: &mut MockApp, sender: Addr) -> ExecuteResult {
+        let msg = mock_execute_withdraw_fund(None, None);
+        self.execute(app, &msg, sender, &[])
+    }
+
+    pub fn execute_update_default_validator(
+        &self,
+        app: &mut MockApp,
+        sender: Addr,
+        validator: Addr,
+    ) -> ExecuteResult {
+        let msg = mock_execute_update_default_validator(validator);
         self.execute(app, &msg, sender, &[])
     }
 
     pub fn query_staked_tokens(
         &self,
-        app: &App,
+        app: &MockApp,
         validator: Option<Addr>,
     ) -> Result<Delegation, ContractError> {
         let msg = mock_get_staked_tokens(validator);
@@ -61,7 +72,10 @@ impl MockValidatorStaking {
             .wrap()
             .query_wasm_smart::<Delegation>(self.addr().clone(), &msg)?)
     }
-    pub fn query_unstaked_tokens(&self, app: &App) -> Result<Vec<UnstakingTokens>, ContractError> {
+    pub fn query_unstaked_tokens(
+        &self,
+        app: &MockApp,
+    ) -> Result<Vec<UnstakingTokens>, ContractError> {
         let msg = mock_get_unstaked_tokens();
         Ok(app
             .wrap()
@@ -90,22 +104,23 @@ pub fn mock_execute_stake(validator: Option<Addr>) -> ExecuteMsg {
     ExecuteMsg::Stake { validator }
 }
 
-pub fn mock_execute_unstake(validator: Option<Addr>) -> ExecuteMsg {
-    ExecuteMsg::Unstake { validator }
+pub fn mock_execute_unstake(validator: Option<Addr>, amount: Option<Uint128>) -> ExecuteMsg {
+    ExecuteMsg::Unstake { validator, amount }
 }
 
-pub fn mock_execute_claim_reward(
-    validator: Option<Addr>,
+pub fn mock_execute_claim_reward(validator: Option<Addr>) -> ExecuteMsg {
+    ExecuteMsg::Claim { validator }
+}
+
+pub fn mock_execute_withdraw_fund(
+    denom: Option<String>,
     recipient: Option<AndrAddr>,
 ) -> ExecuteMsg {
-    ExecuteMsg::Claim {
-        validator,
-        recipient,
-    }
+    ExecuteMsg::WithdrawFunds { denom, recipient }
 }
 
-pub fn mock_execute_withdraw_fund() -> ExecuteMsg {
-    ExecuteMsg::WithdrawFunds {}
+pub fn mock_execute_update_default_validator(validator: Addr) -> ExecuteMsg {
+    ExecuteMsg::UpdateDefaultValidator { validator }
 }
 
 pub fn mock_get_staked_tokens(validator: Option<Addr>) -> QueryMsg {

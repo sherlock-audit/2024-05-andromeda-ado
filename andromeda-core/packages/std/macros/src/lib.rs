@@ -44,67 +44,26 @@ pub fn andr_exec(_args: TokenStream, input: TokenStream) -> TokenStream {
             enum Right {
                 #[serde(rename="amp_receive")]
                 AMPReceive(::andromeda_std::amp::messages::AMPPkt),
-                UpdateOwner {
-                    address: String,
-                },
-                UpdateOperators {
-                    operators: Vec<String>,
+                Ownership(::andromeda_std::ado_base::ownership::OwnershipMessage),
+                UpdateKernelAddress {
+                    address: ::cosmwasm_std::Addr,
                 },
                 UpdateAppContract {
                     address: String,
                 },
-                SetPermission {
-                    actor: ::andromeda_std::amp::AndrAddr,
-                    action: String,
-                    permission: ::andromeda_std::ado_base::permissioning::Permission,
-                },
-                RemovePermission {
-                    action: String,
-                    actor: ::andromeda_std::amp::AndrAddr,
-                },
-                PermissionAction {
-                    action: String
-                },
+                Permissioning(::andromeda_std::ado_base::permissioning::PermissioningMessage),
             }
         }
         .into(),
     );
-    #[cfg(feature = "modules")]
-    {
-        merged = merge_variants(
-            merged,
-            quote! {
-                enum Right {
-                    RegisterModule {
-                        module: ::andromeda_std::ado_base::Module,
-                    },
-                    DeregisterModule {
-                        module_idx: ::cosmwasm_std::Uint64,
-                    },
-                    AlterModule {
-                        module_idx: ::cosmwasm_std::Uint64,
-                        module: ::andromeda_std::ado_base::Module,
-                    },
-                }
-            }
-            .into(),
-        )
-    }
 
-    #[cfg(feature = "withdraw")]
+    #[cfg(feature = "rates")]
     {
         merged = merge_variants(
             merged,
             quote! {
                 enum Right {
-                    Deposit {
-                        recipient: Option<::andromeda_std::amp::AndrAddr>,
-                        msg: Option<::cosmwasm_std::Binary>,
-                    },
-                    Withdraw {
-                        recipient: Option<::andromeda_std::amp::Recipient>,
-                        tokens_to_withdraw: Option<Vec<::andromeda_std::common::withdraw::Withdrawal>>,
-                    },
+                    Rates(::andromeda_std::ado_base::rates::RatesMessage)
                 }
             }
             .into(),
@@ -133,7 +92,6 @@ fn andr_exec_derive(input: DeriveInput) -> DeriveInput {
 /// Includes:
 /// 1. Kernel Address for interacting with aOS
 /// 2. Owner of the ADO (optional, assumed to be sender otherwise)
-/// 3. Modules (optional, requires `modules` feature)
 #[proc_macro_attribute]
 pub fn andr_instantiate(_args: TokenStream, input: TokenStream) -> TokenStream {
     let mut ast = parse_macro_input!(input as DeriveInput);
@@ -162,29 +120,6 @@ pub fn andr_instantiate(_args: TokenStream, input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro_attribute]
-pub fn andr_instantiate_modules(_args: TokenStream, input: TokenStream) -> TokenStream {
-    let mut ast = parse_macro_input!(input as DeriveInput);
-    match &mut ast.data {
-        syn::Data::Struct(ref mut struct_data) => {
-            if let syn::Fields::Named(fields) = &mut struct_data.fields {
-                fields.named.push(
-                    syn::Field::parse_named
-                        .parse2(
-                            quote! { pub modules: Option<Vec<::andromeda_std::ado_base::Module>> },
-                        )
-                        .unwrap(),
-                );
-            }
-            quote! {
-                #ast
-            }
-            .into()
-        }
-        _ => panic!("Macro only works with structs"),
-    }
-}
-
-#[proc_macro_attribute]
 /// Attaches all relevant ADO messages to a set of Query messages for a given contract.
 ///
 /// **Must be placed before `#[cw_serde]`**
@@ -196,24 +131,22 @@ pub fn andr_query(_metadata: TokenStream, input: TokenStream) -> TokenStream {
             enum Right {
                 #[returns(andromeda_std::ado_base::ownership::ContractOwnerResponse)]
                 Owner {},
-                #[returns(andromeda_std::ado_base::operators::OperatorsResponse)]
-                Operators {},
+                #[returns(andromeda_std::ado_base::ownership::ContractPotentialOwnerResponse)]
+                OwnershipRequest {},
                 #[returns(andromeda_std::ado_base::ado_type::TypeResponse)]
                 Type {},
                 #[returns(andromeda_std::ado_base::kernel_address::KernelAddressResponse)]
                 KernelAddress {},
+                #[returns(andromeda_std::ado_base::app_contract::AppContractResponse)]
+                AppContract {},
                 #[returns(andromeda_std::ado_base::ownership::PublisherResponse)]
                 OriginalPublisher {},
                 #[returns(andromeda_std::ado_base::block_height::BlockHeightResponse)]
                 BlockHeightUponCreation {},
-                #[returns(andromeda_std::ado_base::operators::IsOperatorResponse)]
-                IsOperator { address: String },
                 #[returns(andromeda_std::ado_base::version::VersionResponse)]
                 Version {},
-                #[returns(::cosmwasm_std::BalanceResponse)]
-                Balance {
-                    address: ::andromeda_std::amp::AndrAddr,
-                },
+                #[returns(andromeda_std::ado_base::version::ADOBaseVersionResponse)]
+                ADOBaseVersion {},
                 #[returns(Vec<::andromeda_std::ado_base::permissioning::PermissionInfo>)]
                 Permissions { actor: String, limit: Option<u32>, start_after: Option<String> },
                 #[returns(Vec<String>)]
@@ -222,35 +155,20 @@ pub fn andr_query(_metadata: TokenStream, input: TokenStream) -> TokenStream {
         }
         .into(),
     );
-
-    #[cfg(feature = "modules")]
+    #[cfg(feature = "rates")]
     {
         merged = merge_variants(
             merged,
             quote! {
                 enum Right {
-                    #[returns(andromeda_std::ado_base::Module)]
-                    Module { id: ::cosmwasm_std::Uint64 },
-                    #[returns(Vec<String>)]
-                    ModuleIds {},
+                    #[returns(Option<::andromeda_std::ado_base::rates::Rate>)]
+                    Rates {action: String},
+                    #[returns(::andromeda_std::ado_base::rates::AllRatesResponse)]
+                    AllRates {}
                 }
             }
             .into(),
-        );
+        )
     }
-    #[cfg(feature = "module_hooks")]
-    {
-        merged = merge_variants(
-            merged,
-            quote! {
-                enum Right {
-                    #[returns(::cosmwasm_std::Binary)]
-                    AndrHook(::andromeda_std::ado_base::hooks::AndromedaHook),
-                }
-            }
-            .into(),
-        );
-    }
-
     merged
 }

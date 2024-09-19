@@ -5,18 +5,31 @@
 # Builds "andromeda-contract" contract and "some-category" category
 
 # LOG all the contracts compiled with there compressed file size
-local FILE_LOG=""
+FILE_LOG=""
 
-build_contract () {
+get_version_filename (){
     local CONTRACT=$1
-    echo "Building contract $CONTRACT..."
-    cargo wasm -p $CONTRACT -q
-
     # Get the version of the contract processed
     local BUILD_VERSION=$(cargo pkgid $CONTRACT | cut -d# -f2 | cut -d: -f2)
     local BUILD_TARGET=${CONTRACT//-/_}
+
+    echo "$BUILD_TARGET@$BUILD_VERSION";
+}
+
+build_contract () {
+    local CONTRACT_PATH=$1;
+
+    local CONTRACT=`basename $CONTRACT_PATH`;
+    echo "Building contract $CONTRACT..."
+    if ! cargo wasm -p $CONTRACT -q; then
+        exit 1
+    fi
+
+    local BUILD_TARGET=${CONTRACT//-/_}
+    local VERSION_FILENAME=$(get_version_filename $CONTRACT);
+
     local IN_FILE="./target/wasm32-unknown-unknown/release/$BUILD_TARGET.wasm"
-    local OUT_FILE="./artifacts/$BUILD_TARGET@$BUILD_VERSION.wasm"
+    local OUT_FILE="./artifacts/$VERSION_FILENAME.wasm"
     wasm-opt -Os $IN_FILE -o $OUT_FILE
     
     # NOT SO IMPORTANT STEPS
@@ -32,7 +45,7 @@ build_category () {
         if [[ "$(basename $directory)" = "$1" ]]; then
             echo "Building all contracts in category $(basename $directory)..."
             for contract in $directory/*/; do
-                build_contract $(basename $contract)
+                build_contract $contract;
             done
             break
         fi
@@ -73,6 +86,7 @@ rm -rf ./target
 rm -rf ./artifacts
 mkdir artifacts
 
+set -e
 for target in "$@"; do
     if [[ "$target" = "all" ]]; then
         build_all
