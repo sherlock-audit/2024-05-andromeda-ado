@@ -38,11 +38,11 @@ pub fn instantiate(
         deps.storage,
         env,
         deps.api,
+        &deps.querier,
         info,
         BaseInstantiateMsg {
-            ado_type: "shunting".to_string(),
+            ado_type: CONTRACT_NAME.to_string(),
             ado_version: CONTRACT_VERSION.to_string(),
-            operators: None,
             kernel_address: msg.kernel_address,
             owner: msg.owner,
         },
@@ -156,7 +156,7 @@ fn parse_params(deps: Deps, params: Vec<EvaluateParam>) -> Result<Vec<String>, C
                 }
                 .into();
 
-                let raw_result: Value = deps.querier.query::<Value>(&query_msg).unwrap();
+                let raw_result: Value = deps.querier.query::<Value>(&query_msg)?;
                 let json = JSON::from(raw_result);
                 let Value::String(val) = json.get(&accessor).unwrap() else {
                     return Err(ContractError::InvalidExpression {

@@ -1,313 +1,819 @@
-use andromeda_app::app::{AppComponent, ComponentType};
-use andromeda_app_contract::mock::{mock_andromeda_app, MockApp};
+use std::str::FromStr;
+
+use andromeda_app::app::AppComponent;
+use andromeda_app_contract::mock::{mock_andromeda_app, MockAppContract};
 use andromeda_crowdfund::mock::{
-    mock_andromeda_crowdfund, mock_crowdfund_instantiate_msg, MockCrowdfund,
+    mock_andromeda_crowdfund, mock_crowdfund_instantiate_msg, mock_purchase_cw20_msg, MockCrowdfund,
 };
+use andromeda_cw20::mock::{mock_andromeda_cw20, mock_cw20_instantiate_msg, mock_minter, MockCW20};
 use andromeda_cw721::mock::{mock_andromeda_cw721, mock_cw721_instantiate_msg, MockCW721};
 use andromeda_finance::splitter::AddressPercent;
-use andromeda_std::amp::{AndrAddr, Recipient};
-
-use andromeda_modules::rates::{Rate, RateInfo};
-use andromeda_rates::mock::{mock_andromeda_rates, mock_rates_instantiate_msg};
+use andromeda_non_fungible_tokens::{
+    crowdfund::{CampaignConfig, CampaignStage, PresaleTierOrder, SimpleTierOrder, TierMetaData},
+    cw721::TokenExtension,
+};
 use andromeda_splitter::mock::{
     mock_andromeda_splitter, mock_splitter_instantiate_msg, mock_splitter_send_msg,
 };
-use andromeda_std::ado_base::modules::Module;
-use std::str::FromStr;
-
-use andromeda_testing::{mock::MockAndromeda, mock_contract::MockContract};
-use andromeda_vault::mock::{
-    mock_andromeda_vault, mock_vault_deposit_msg, mock_vault_instantiate_msg,
+use andromeda_std::{
+    amp::{AndrAddr, Recipient},
+    common::{denom::Asset, encode_binary, Milliseconds},
 };
-use cosmwasm_std::{coin, to_json_binary, Addr, BlockInfo, Decimal, Uint128};
-use cw721::Expiration;
-use cw_multi_test::{App, Executor};
+use andromeda_testing::{
+    mock::{mock_app, MockApp},
+    mock_builder::MockAndromedaBuilder,
+    MockAndromeda, MockContract,
+};
+use cosmwasm_std::{coin, to_json_binary, BlockInfo, Coin, Decimal, Empty, Uint128, Uint64};
+use cw20::Cw20Coin;
+use cw_multi_test::Contract;
+use rstest::{fixture, rstest};
 
-fn mock_app() -> App {
-    App::new(|router, _api, storage| {
-        router
-            .bank
-            .init_balance(
-                storage,
-                &Addr::unchecked("owner"),
-                [coin(999999, "uandr")].to_vec(),
-            )
-            .unwrap();
-        router
-            .bank
-            .init_balance(
-                storage,
-                &Addr::unchecked("buyer_one"),
-                [coin(100, "uandr")].to_vec(),
-            )
-            .unwrap();
-        router
-            .bank
-            .init_balance(
-                storage,
-                &Addr::unchecked("buyer_two"),
-                [coin(100, "uandr")].to_vec(),
-            )
-            .unwrap();
-        router
-            .bank
-            .init_balance(
-                storage,
-                &Addr::unchecked("buyer_three"),
-                [coin(100, "uandr")].to_vec(),
-            )
-            .unwrap();
-    })
+struct TestCase {
+    router: MockApp,
+    andr: MockAndromeda,
+    crowdfund: MockCrowdfund,
+    cw20: Option<MockCW20>,
+    cw721: MockCW721,
+    presale: Vec<PresaleTierOrder>,
 }
 
-fn mock_andromeda(app: &mut App, admin_address: Addr) -> MockAndromeda {
-    MockAndromeda::new(app, &admin_address)
+#[fixture]
+fn wallets() -> Vec<(&'static str, Vec<Coin>)> {
+    vec![
+        ("owner", vec![]),
+        ("buyer_one", vec![coin(1000000, "uandr")]),
+        ("recipient", vec![]),
+        ("recipient1", vec![]),
+        ("recipient2", vec![]),
+    ]
 }
 
-#[test]
-fn test_crowdfund_app() {
-    let owner = Addr::unchecked("owner");
-    let vault_one_recipient_addr = Addr::unchecked("vault_one_recipient");
-    let vault_two_recipient_addr = Addr::unchecked("vault_two_recipient");
-    let buyer_one = Addr::unchecked("buyer_one");
-    let buyer_two = Addr::unchecked("buyer_two");
-    let buyer_three = Addr::unchecked("buyer_three");
+#[fixture]
+fn contracts() -> Vec<(&'static str, Box<dyn Contract<Empty>>)> {
+    vec![
+        ("cw20", mock_andromeda_cw20()),
+        ("cw721", mock_andromeda_cw721()),
+        ("crowdfund", mock_andromeda_crowdfund()),
+        ("splitter", mock_andromeda_splitter()),
+        ("app-contract", mock_andromeda_app()),
+    ]
+}
 
-    let mut router = mock_app();
-    let andr = mock_andromeda(&mut router, owner.clone());
+#[fixture]
+fn setup(
+    #[default(true)] use_native_token: bool,
+    #[default(None)] withdrawal_recipient: Option<Recipient>,
+    wallets: Vec<(&'static str, Vec<Coin>)>,
+    contracts: Vec<(&'static str, Box<dyn Contract<Empty>>)>,
+) -> TestCase {
+    let mut router = mock_app(None);
+    let andr = MockAndromedaBuilder::new(&mut router, "admin")
+        .with_wallets(wallets)
+        .with_contracts(contracts)
+        .build(&mut router);
 
-    // Store contract codes
-    andr.store_ado(&mut router, mock_andromeda_cw721(), "cw721");
-    andr.store_ado(&mut router, mock_andromeda_crowdfund(), "crowdfund");
-    andr.store_ado(&mut router, mock_andromeda_vault(), "vault");
-    andr.store_ado(&mut router, mock_andromeda_splitter(), "splitter");
-    let app_code_id = andr.store_ado(&mut router, mock_andromeda_app(), "app");
-    let rates_code_id = andr.store_ado(&mut router, mock_andromeda_rates(), "rates");
+    let owner = andr.get_wallet("owner");
+    let buyer_one = andr.get_wallet("buyer_one");
+    let recipient =
+        withdrawal_recipient.unwrap_or(Recipient::new(andr.get_wallet("recipient"), None));
 
-    // Generate App Components
-    // App component names must be less than 3 characters or longer than 54 characters to force them to be 'invalid' as the MockApi struct used within the CosmWasm App struct only contains those two validation checks
-    let rates_recipient = "rates_recipient";
-    // Generate rates contract
-    let rates: Vec<RateInfo> = [RateInfo {
-        rate: Rate::Flat(coin(1, "uandr")),
-        is_additive: false,
-        recipients: [Recipient::from_string(rates_recipient.to_string())].to_vec(),
-        description: Some("Some test rate".to_string()),
-    }]
-    .to_vec();
-    let rates_init_msg = mock_rates_instantiate_msg(rates, andr.kernel.addr().to_string(), None);
-    let rates_addr = router
-        .instantiate_contract(
-            rates_code_id,
-            owner.clone(),
-            &rates_init_msg,
-            &[],
-            "rates",
-            None,
-        )
-        .unwrap();
-
-    let modules: Vec<Module> = vec![Module::new("rates", rates_addr.to_string(), false)];
-
-    let crowdfund_app_component = AppComponent {
-        name: "1".to_string(),
-        ado_type: "crowdfund".to_string(),
-        component_type: ComponentType::New(
-            to_json_binary(&mock_crowdfund_instantiate_msg(
-                AndrAddr::from_string("./2".to_string()),
-                false,
-                Some(modules),
-                andr.kernel.addr().to_string(),
-                None,
-            ))
-            .unwrap(),
-        ),
-    };
-    let cw721_component = AppComponent {
-        name: "2".to_string(),
-        ado_type: "cw721".to_string(),
-        component_type: ComponentType::new(mock_cw721_instantiate_msg(
-            "Test Tokens".to_string(),
-            "TT".to_string(),
-            "./1", // Crowdfund must be minter
-            None,
-            andr.kernel.addr().to_string(),
-            None,
-        )),
-    };
-    let vault_one_app_component = AppComponent {
-        name: "3".to_string(),
-        ado_type: "vault".to_string(),
-        component_type: ComponentType::new(mock_vault_instantiate_msg(
-            andr.kernel.addr().to_string(),
-            None,
-        )),
-    };
-    let vault_two_app_component = AppComponent {
-        name: "4".to_string(),
-        ado_type: "vault".to_string(),
-        component_type: ComponentType::new(mock_vault_instantiate_msg(
-            andr.kernel.addr().to_string(),
-            None,
-        )),
-    };
-
-    // Create splitter recipient structures
-    let vault_one_recipient =
-        Recipient::from_string(format!("~/am/app/{}", vault_one_app_component.name)).with_msg(
-            mock_vault_deposit_msg(
-                Some(AndrAddr::from_string(vault_one_recipient_addr.to_string())),
-                None,
-            ),
-        );
-    let vault_two_recipient =
-        Recipient::from_string(format!("~/am/app/{}", vault_two_app_component.name)).with_msg(
-            mock_vault_deposit_msg(
-                Some(AndrAddr::from_string(vault_two_recipient_addr.to_string())),
-                None,
-            ),
-        );
+    // Prepare Splitter component which can be used as a withdrawal address for some test cases
+    let recipient_1 = andr.get_wallet("recipient1");
+    let recipient_2 = andr.get_wallet("recipient2");
 
     let splitter_recipients = vec![
         AddressPercent {
-            recipient: vault_one_recipient,
-            percent: Decimal::from_str("0.5").unwrap(),
+            recipient: Recipient::from_string(recipient_1.to_string()),
+            percent: Decimal::from_str("0.2").unwrap(),
         },
         AddressPercent {
-            recipient: vault_two_recipient,
-            percent: Decimal::from_str("0.5").unwrap(),
+            recipient: Recipient::from_string(recipient_2.to_string()),
+            percent: Decimal::from_str("0.8").unwrap(),
         },
     ];
-
     let splitter_init_msg =
         mock_splitter_instantiate_msg(splitter_recipients, andr.kernel.addr().clone(), None, None);
-    let splitter_app_component = AppComponent {
-        name: "5".to_string(),
-        component_type: ComponentType::new(&splitter_init_msg),
-        ado_type: "splitter".to_string(),
+    let splitter_component = AppComponent::new(
+        "splitter".to_string(),
+        "splitter".to_string(),
+        to_json_binary(&splitter_init_msg).unwrap(),
+    );
+    // Add cw721 component
+    let cw721_init_msg = mock_cw721_instantiate_msg(
+        "Campaign Tier".to_string(),
+        "CT".to_string(),
+        "./crowdfund".to_string(),
+        andr.kernel.addr().to_string(),
+        None,
+    );
+
+    let cw721_component = AppComponent::new(
+        "cw721".to_string(),
+        "cw721".to_string(),
+        to_json_binary(&cw721_init_msg).unwrap(),
+    );
+
+    let mut app_components = vec![splitter_component, cw721_component.clone()];
+
+    // Add cw20 components for test cases using cw20
+    let cw20_component: Option<AppComponent> = match use_native_token {
+        true => None,
+        false => {
+            let initial_balances = vec![Cw20Coin {
+                address: buyer_one.to_string(),
+                amount: Uint128::from(1000000u128),
+            }];
+            let cw20_init_msg = mock_cw20_instantiate_msg(
+                None,
+                "Test Tokens".to_string(),
+                "TTT".to_string(),
+                6,
+                initial_balances,
+                Some(mock_minter(
+                    owner.to_string(),
+                    Some(Uint128::from(1000000u128)),
+                )),
+                andr.kernel.addr().to_string(),
+            );
+            let cw20_component = AppComponent::new(
+                "cw20".to_string(),
+                "cw20".to_string(),
+                to_json_binary(&cw20_init_msg).unwrap(),
+            );
+            app_components.push(cw20_component.clone());
+            Some(cw20_component)
+        }
     };
+    let denom = match use_native_token {
+        true => Asset::NativeToken("uandr".to_string()),
+        false => Asset::Cw20Token(AndrAddr::from_string(format!(
+            "./{}",
+            cw20_component.clone().unwrap().name
+        ))),
+    };
+    // Add campaign component
+    // *** IMPORTANT ***
+    //    campaign component should be added in the last order
+    //    as it is using vfs to other components(potentially components in the same app)
 
-    let app_components = vec![
-        cw721_component.clone(),
-        crowdfund_app_component.clone(),
-        vault_one_app_component.clone(),
-        vault_two_app_component.clone(),
-        splitter_app_component.clone(),
-    ];
+    let campaign_config = mock_campaign_config(
+        denom,
+        AndrAddr::from_string(format!("./{}", cw721_component.name)),
+        recipient.clone(),
+        Some(Uint128::new(1000)),
+    );
+    let crowdfund_init_msg = mock_crowdfund_instantiate_msg(
+        campaign_config,
+        vec![],
+        andr.kernel.addr(),
+        Some(owner.to_string()),
+    );
+    let crowdfund_component = AppComponent::new(
+        "crowdfund".to_string(),
+        "crowdfund".to_string(),
+        to_json_binary(&crowdfund_init_msg).unwrap(),
+    );
 
-    let app = MockApp::instantiate(
-        app_code_id,
-        owner.clone(),
+    app_components.push(crowdfund_component.clone());
+
+    let app = MockAppContract::instantiate(
+        andr.get_code_id(&mut router, "app-contract"),
+        owner,
         &mut router,
-        "app",
+        "Crowdfund App",
         app_components.clone(),
-        andr.kernel.addr().clone(),
+        andr.kernel.addr(),
         Some(owner.to_string()),
     );
 
-    let components = app.query_components(&router);
-    assert_eq!(components, app_components);
+    let crowdfund: MockCrowdfund =
+        app.query_ado_by_component_name(&router, crowdfund_component.name);
 
-    let _vault_one_addr = app.query_component_addr(&router, vault_one_app_component.name);
-    let _vault_two_addr = app.query_component_addr(&router, vault_two_app_component.name);
-    app.execute_claim_ownership(&mut router, owner.clone(), None)
-        .unwrap();
+    let cw721: MockCW721 = app.query_ado_by_component_name(&router, cw721_component.name);
 
-    let cw721_contract =
-        app.query_ado_by_component_name::<MockCW721>(&router, cw721_component.name);
-    let crowdfund_contract =
-        app.query_ado_by_component_name::<MockCrowdfund>(&router, crowdfund_app_component.name);
+    let cw20: Option<MockCW20> = match use_native_token {
+        true => None,
+        false => Some(app.query_ado_by_component_name(&router, cw20_component.unwrap().name)),
+    };
 
-    let minter = cw721_contract.query_minter(&router);
-    assert_eq!(minter, crowdfund_contract.addr());
-
-    // Mint Tokens
-    crowdfund_contract
-        .execute_quick_mint(owner.clone(), &mut router, 5, owner.to_string())
-        .unwrap();
-
-    // Start Sale
-    let token_price = coin(100, "uandr");
-
-    let sale_recipient =
-        Recipient::from_string(format!("~/am/app/{}", splitter_app_component.name))
-            .with_msg(mock_splitter_send_msg());
-    let expiration = Expiration::AtHeight(router.block_info().height + 5);
-    crowdfund_contract
-        .execute_start_sale(
+    let meta_data = TierMetaData {
+        token_uri: None,
+        extension: TokenExtension {
+            ..Default::default()
+        },
+    };
+    crowdfund
+        .execute_add_tier(
             owner.clone(),
             &mut router,
-            expiration,
-            token_price.clone(),
-            Uint128::from(3u128),
-            Some(1),
-            sale_recipient,
+            Uint64::one(),
+            "Tier 1".to_string(),
+            Uint128::new(100),
+            None,
+            meta_data.clone(),
+        )
+        .unwrap();
+    crowdfund
+        .execute_add_tier(
+            owner.clone(),
+            &mut router,
+            Uint64::new(2u64),
+            "Tier 2".to_string(),
+            Uint128::new(200),
+            Some(Uint128::new(100)),
+            meta_data,
         )
         .unwrap();
 
-    // Buy Tokens
-    let buyers = vec![buyer_one, buyer_two, buyer_three];
-    for buyer in buyers.clone() {
-        crowdfund_contract
-            .execute_purchase(buyer, &mut router, Some(1), &[token_price.clone()])
-            .unwrap();
-    }
-    let crowdfund_balance = router
-        .wrap()
-        .query_balance(crowdfund_contract.addr().clone(), token_price.denom)
-        .unwrap();
-    assert_eq!(crowdfund_balance.amount, Uint128::from(300u128));
+    let presale = vec![PresaleTierOrder {
+        level: Uint64::one(),
+        amount: Uint128::new(10u128),
+        orderer: buyer_one.clone(),
+    }];
 
-    // End Sale
-    let block_info = router.block_info();
+    TestCase {
+        router,
+        andr,
+        crowdfund,
+        cw20,
+        cw721,
+        presale,
+    }
+}
+
+#[rstest]
+fn test_successful_crowdfund_app_native(setup: TestCase) {
+    let TestCase {
+        mut router,
+        andr,
+        crowdfund,
+        cw721,
+        presale,
+        ..
+    } = setup;
+
+    let owner = andr.get_wallet("owner");
+    let buyer_one = andr.get_wallet("buyer_one");
+    let recipient = Recipient::new(andr.get_wallet("recipient"), None);
+
+    // Start campaign
+    let start_time = None;
+    let end_time = Milliseconds::from_nanos(router.block_info().time.plus_days(1).nanos());
+
+    let _ = crowdfund.execute_start_campaign(
+        owner.clone(),
+        &mut router,
+        start_time,
+        end_time,
+        Some(presale),
+    );
+    let summary = crowdfund.query_campaign_summary(&mut router);
+    assert_eq!(summary.current_capital, 0);
+    assert_eq!(summary.current_stage, CampaignStage::ONGOING.to_string());
+
+    // Purchase tiers
     router.set_block(BlockInfo {
-        height: block_info.height + 5,
-        time: block_info.time,
-        chain_id: block_info.chain_id,
+        height: router.block_info().height,
+        time: router.block_info().time.plus_seconds(1),
+        chain_id: router.block_info().chain_id,
     });
 
-    crowdfund_contract
-        .execute_end_sale(owner.clone(), &mut router, None)
-        .unwrap();
-    crowdfund_contract
-        .execute_end_sale(owner, &mut router, None)
-        .unwrap();
+    let orders = vec![
+        SimpleTierOrder {
+            level: Uint64::one(),
+            amount: Uint128::new(10),
+        },
+        SimpleTierOrder {
+            level: Uint64::new(2),
+            amount: Uint128::new(10),
+        },
+    ];
+    let buyer_one_original_balance = router
+        .wrap()
+        .query_balance(buyer_one.clone(), "uandr")
+        .unwrap()
+        .amount;
+    let _ = crowdfund.execute_purchase(
+        buyer_one.clone(),
+        &mut router,
+        orders,
+        vec![coin(5000, "uandr")],
+    );
+    let buyer_one_balance = router
+        .wrap()
+        .query_balance(buyer_one.clone(), "uandr")
+        .unwrap()
+        .amount;
 
-    // Check final state
-    //Check token transfers
-    for (i, buyer) in buyers.iter().enumerate() {
-        let owner = cw721_contract.query_owner_of(&router, i.to_string());
-        assert_eq!(owner, buyer.to_string());
+    assert_eq!(
+        buyer_one_balance,
+        buyer_one_original_balance - Uint128::new(10 * 100 + 200 * 10)
+    );
+
+    // End campaign
+    let _ = crowdfund.execute_end_campaign(owner.clone(), &mut router);
+    let summary = crowdfund.query_campaign_summary(&mut router);
+    assert_eq!(summary.current_capital, 10 * 100 + 200 * 10);
+    assert_eq!(summary.current_stage, CampaignStage::SUCCESS.to_string());
+    let recipient_balance = router
+        .wrap()
+        .query_balance(recipient.clone().address, "uandr")
+        .unwrap()
+        .amount;
+    assert_eq!(summary.current_capital, recipient_balance.into());
+
+    // Claim tier
+    let _ = crowdfund
+        .execute_claim(buyer_one.clone(), &mut router)
+        .unwrap();
+    // buyer_one should own 30 tiers now (10 pre order + 20 purchased)
+    let owner_resp = cw721.query_owner_of(&router, "0".to_string());
+    assert_eq!(owner_resp, buyer_one.to_string());
+    let owner_resp = cw721.query_owner_of(&router, "29".to_string());
+    assert_eq!(owner_resp, buyer_one.to_string());
+}
+
+#[rstest]
+fn test_crowdfund_app_native_discard(
+    #[with(true, Some(mock_recipient_with_invalid_msg("./splitter")))] setup: TestCase,
+) {
+    let TestCase {
+        mut router,
+        andr,
+        crowdfund,
+        presale,
+        ..
+    } = setup;
+
+    let owner = andr.get_wallet("owner");
+    let buyer_one = andr.get_wallet("buyer_one");
+
+    // Start campaign
+    let start_time = None;
+    let end_time = Milliseconds::from_nanos(router.block_info().time.plus_days(1).nanos());
+
+    let _ = crowdfund.execute_start_campaign(
+        owner.clone(),
+        &mut router,
+        start_time,
+        end_time,
+        Some(presale),
+    );
+    let summary = crowdfund.query_campaign_summary(&mut router);
+    assert_eq!(summary.current_capital, 0);
+    assert_eq!(summary.current_stage, CampaignStage::ONGOING.to_string());
+
+    // Purchase tiers
+    router.set_block(BlockInfo {
+        height: router.block_info().height,
+        time: router.block_info().time.plus_seconds(1),
+        chain_id: router.block_info().chain_id,
+    });
+
+    let orders = vec![
+        SimpleTierOrder {
+            level: Uint64::one(),
+            amount: Uint128::new(10),
+        },
+        SimpleTierOrder {
+            level: Uint64::new(2),
+            amount: Uint128::new(10),
+        },
+    ];
+    let buyer_one_original_balance = router
+        .wrap()
+        .query_balance(buyer_one.clone(), "uandr")
+        .unwrap()
+        .amount;
+    let _ = crowdfund.execute_purchase(
+        buyer_one.clone(),
+        &mut router,
+        orders,
+        vec![coin(5000, "uandr")],
+    );
+    let buyer_one_balance = router
+        .wrap()
+        .query_balance(buyer_one.clone(), "uandr")
+        .unwrap()
+        .amount;
+
+    assert_eq!(
+        buyer_one_balance,
+        buyer_one_original_balance - Uint128::new(10 * 100 + 200 * 10)
+    );
+
+    let _ = crowdfund.execute_end_campaign(owner.clone(), &mut router);
+
+    let summary = crowdfund.query_campaign_summary(&mut router);
+
+    // Campaign could not be ended due to invalid withdrawal recipient msg
+    assert_eq!(summary.current_stage, CampaignStage::ONGOING.to_string());
+
+    // Discard campaign
+    let _ = crowdfund.execute_discard_campaign(owner.clone(), &mut router);
+    let summary = crowdfund.query_campaign_summary(&mut router);
+    assert_eq!(summary.current_stage, CampaignStage::FAILED.to_string());
+
+    // Refund
+    let buyer_one_original_balance = router
+        .wrap()
+        .query_balance(buyer_one.clone(), "uandr")
+        .unwrap()
+        .amount;
+    let _ = crowdfund
+        .execute_claim(buyer_one.clone(), &mut router)
+        .unwrap();
+    let buyer_one_balance = router
+        .wrap()
+        .query_balance(buyer_one.clone(), "uandr")
+        .unwrap()
+        .amount;
+    assert_eq!(
+        buyer_one_balance,
+        buyer_one_original_balance + Uint128::new(10 * 100 + 200 * 10)
+    );
+}
+
+#[rstest]
+fn test_crowdfund_app_native_with_ado_recipient(
+    #[with(true, Some(mock_recipient_with_valid_msg("./splitter")))] setup: TestCase,
+) {
+    let TestCase {
+        mut router,
+        andr,
+        crowdfund,
+        presale,
+        ..
+    } = setup;
+
+    let owner = andr.get_wallet("owner");
+    let buyer_one = andr.get_wallet("buyer_one");
+    let recipient_1 = andr.get_wallet("recipient1");
+    let recipient_2 = andr.get_wallet("recipient2");
+
+    // Start campaign
+    let start_time = None;
+    let end_time = Milliseconds::from_nanos(router.block_info().time.plus_days(1).nanos());
+
+    let _ = crowdfund.execute_start_campaign(
+        owner.clone(),
+        &mut router,
+        start_time,
+        end_time,
+        Some(presale),
+    );
+    let summary = crowdfund.query_campaign_summary(&mut router);
+    assert_eq!(summary.current_capital, 0);
+    assert_eq!(summary.current_stage, CampaignStage::ONGOING.to_string());
+
+    // Purchase tiers
+    router.set_block(BlockInfo {
+        height: router.block_info().height,
+        time: router.block_info().time.plus_seconds(1),
+        chain_id: router.block_info().chain_id,
+    });
+
+    let orders = vec![
+        SimpleTierOrder {
+            level: Uint64::one(),
+            amount: Uint128::new(10),
+        },
+        SimpleTierOrder {
+            level: Uint64::new(2),
+            amount: Uint128::new(10),
+        },
+    ];
+    let buyer_one_original_balance = router
+        .wrap()
+        .query_balance(buyer_one.clone(), "uandr")
+        .unwrap()
+        .amount;
+    let _ = crowdfund.execute_purchase(
+        buyer_one.clone(),
+        &mut router,
+        orders,
+        vec![coin(5000, "uandr")],
+    );
+    let buyer_one_balance = router
+        .wrap()
+        .query_balance(buyer_one.clone(), "uandr")
+        .unwrap()
+        .amount;
+
+    assert_eq!(
+        buyer_one_balance,
+        buyer_one_original_balance - Uint128::new(10 * 100 + 200 * 10)
+    );
+
+    let _ = crowdfund.execute_end_campaign(owner.clone(), &mut router);
+
+    let summary = crowdfund.query_campaign_summary(&mut router);
+
+    // Campaign could not be ended due to invalid withdrawal recipient msg
+    assert_eq!(summary.current_stage, CampaignStage::SUCCESS.to_string());
+
+    let recipient_1_balance = router
+        .wrap()
+        .query_balance(recipient_1, "uandr")
+        .unwrap()
+        .amount;
+    let recipient_2_balance = router
+        .wrap()
+        .query_balance(recipient_2, "uandr")
+        .unwrap()
+        .amount;
+    assert_eq!(recipient_1_balance.u128(), summary.current_capital / 5);
+    assert_eq!(recipient_2_balance.u128(), summary.current_capital * 4 / 5);
+}
+
+#[rstest]
+fn test_failed_crowdfund_app_native(setup: TestCase) {
+    let TestCase {
+        mut router,
+        andr,
+        crowdfund,
+        presale,
+        ..
+    } = setup;
+
+    let owner = andr.get_wallet("owner");
+    let buyer_one = andr.get_wallet("buyer_one");
+
+    // Start campaign
+    let start_time = None;
+    let end_time = Milliseconds::from_nanos(router.block_info().time.plus_days(1).nanos());
+
+    let _ = crowdfund.execute_start_campaign(
+        owner.clone(),
+        &mut router,
+        start_time,
+        end_time,
+        Some(presale),
+    );
+    let summary = crowdfund.query_campaign_summary(&mut router);
+    assert_eq!(summary.current_capital, 0);
+    assert_eq!(summary.current_stage, CampaignStage::ONGOING.to_string());
+
+    // Purchase tiers
+    router.set_block(BlockInfo {
+        height: router.block_info().height,
+        time: router.block_info().time.plus_seconds(1),
+        chain_id: router.block_info().chain_id,
+    });
+
+    let orders = vec![SimpleTierOrder {
+        level: Uint64::one(),
+        amount: Uint128::new(5),
+    }];
+    let buyer_one_original_balance = router
+        .wrap()
+        .query_balance(buyer_one.clone(), "uandr")
+        .unwrap()
+        .amount;
+    let _ = crowdfund.execute_purchase(
+        buyer_one.clone(),
+        &mut router,
+        orders,
+        vec![coin(5000, "uandr")],
+    );
+    let buyer_one_balance = router
+        .wrap()
+        .query_balance(buyer_one.clone(), "uandr")
+        .unwrap()
+        .amount;
+
+    assert_eq!(
+        buyer_one_balance,
+        buyer_one_original_balance - Uint128::new(5 * 100)
+    );
+
+    // End campaign
+    router.set_block(BlockInfo {
+        height: router.block_info().height,
+        time: router.block_info().time.plus_days(2),
+        chain_id: router.block_info().chain_id,
+    });
+
+    let _ = crowdfund.execute_end_campaign(owner.clone(), &mut router);
+    let summary = crowdfund.query_campaign_summary(&mut router);
+    assert_eq!(summary.current_capital, 5 * 100);
+    assert_eq!(summary.current_stage, CampaignStage::FAILED.to_string());
+
+    // Refund
+    let buyer_one_original_balance = router
+        .wrap()
+        .query_balance(buyer_one.clone(), "uandr")
+        .unwrap()
+        .amount;
+    let _ = crowdfund
+        .execute_claim(buyer_one.clone(), &mut router)
+        .unwrap();
+    let buyer_one_balance = router
+        .wrap()
+        .query_balance(buyer_one.clone(), "uandr")
+        .unwrap()
+        .amount;
+    assert_eq!(
+        buyer_one_balance,
+        buyer_one_original_balance + Uint128::new(5 * 100)
+    );
+}
+
+#[rstest]
+fn test_successful_crowdfund_app_cw20(#[with(false)] setup: TestCase) {
+    let TestCase {
+        mut router,
+        andr,
+        cw721,
+        crowdfund,
+        cw20,
+        presale,
+    } = setup;
+    let cw20 = cw20.unwrap();
+    let owner = andr.get_wallet("owner");
+    let buyer_one = andr.get_wallet("buyer_one");
+    let recipient = Recipient::new(andr.get_wallet("recipient"), None);
+
+    let start_time = None;
+    let end_time = Milliseconds::from_nanos(router.block_info().time.plus_days(1).nanos());
+
+    let _ = crowdfund.execute_start_campaign(
+        owner.clone(),
+        &mut router,
+        start_time,
+        end_time,
+        Some(presale),
+    );
+    let summary = crowdfund.query_campaign_summary(&mut router);
+    assert_eq!(summary.current_capital, 0);
+    assert_eq!(summary.current_stage, CampaignStage::ONGOING.to_string());
+
+    // Purchase tiers
+    router.set_block(BlockInfo {
+        height: router.block_info().height,
+        time: router.block_info().time.plus_seconds(1),
+        chain_id: router.block_info().chain_id,
+    });
+
+    let orders = vec![
+        SimpleTierOrder {
+            level: Uint64::one(),
+            amount: Uint128::new(10),
+        },
+        SimpleTierOrder {
+            level: Uint64::new(2),
+            amount: Uint128::new(10),
+        },
+    ];
+    let buyer_one_original_balance = cw20.query_balance(&router, buyer_one.clone());
+    let hook_msg = mock_purchase_cw20_msg(orders);
+
+    cw20.execute_send(
+        &mut router,
+        buyer_one.clone(),
+        crowdfund.addr(),
+        Uint128::new(5000),
+        &hook_msg,
+    )
+    .unwrap();
+
+    let buyer_one_balance = cw20.query_balance(&router, buyer_one.clone());
+    assert_eq!(
+        buyer_one_balance,
+        buyer_one_original_balance - Uint128::new(10 * 100 + 200 * 10)
+    );
+
+    // End campaign
+    let _ = crowdfund.execute_end_campaign(owner.clone(), &mut router);
+    let summary = crowdfund.query_campaign_summary(&mut router);
+    assert_eq!(summary.current_capital, 10 * 100 + 200 * 10);
+    assert_eq!(summary.current_stage, CampaignStage::SUCCESS.to_string());
+    let recipient_balance = cw20.query_balance(&router, recipient.clone().address);
+    assert_eq!(summary.current_capital, recipient_balance.into());
+
+    // Claim tier
+    let _ = crowdfund
+        .execute_claim(buyer_one.clone(), &mut router)
+        .unwrap();
+    // buyer_one should own 30 tiers now (10 pre order + 20 purchased)
+    let owner_resp = cw721.query_owner_of(&router, "0".to_string());
+    assert_eq!(owner_resp, buyer_one.to_string());
+    let owner_resp = cw721.query_owner_of(&router, "29".to_string());
+    assert_eq!(owner_resp, buyer_one.to_string());
+}
+
+#[rstest]
+fn test_failed_crowdfund_app_cw20(#[with(false)] setup: TestCase) {
+    let TestCase {
+        mut router,
+        andr,
+        crowdfund,
+        presale,
+        cw20,
+        ..
+    } = setup;
+    let cw20 = cw20.unwrap();
+
+    let owner = andr.get_wallet("owner");
+    let buyer_one = andr.get_wallet("buyer_one");
+
+    // Start campaign
+    let start_time = None;
+    let end_time = Milliseconds::from_nanos(router.block_info().time.plus_days(1).nanos());
+
+    let _ = crowdfund.execute_start_campaign(
+        owner.clone(),
+        &mut router,
+        start_time,
+        end_time,
+        Some(presale),
+    );
+    let summary = crowdfund.query_campaign_summary(&mut router);
+    assert_eq!(summary.current_capital, 0);
+    assert_eq!(summary.current_stage, CampaignStage::ONGOING.to_string());
+
+    // Purchase tiers
+    router.set_block(BlockInfo {
+        height: router.block_info().height,
+        time: router.block_info().time.plus_seconds(1),
+        chain_id: router.block_info().chain_id,
+    });
+
+    let orders = vec![SimpleTierOrder {
+        level: Uint64::one(),
+        amount: Uint128::new(5),
+    }];
+
+    let buyer_one_original_balance = cw20.query_balance(&router, buyer_one.clone());
+    let hook_msg = mock_purchase_cw20_msg(orders);
+
+    cw20.execute_send(
+        &mut router,
+        buyer_one.clone(),
+        crowdfund.addr(),
+        Uint128::new(5000),
+        &hook_msg,
+    )
+    .unwrap();
+
+    let buyer_one_balance = cw20.query_balance(&router, buyer_one.clone());
+
+    assert_eq!(
+        buyer_one_balance,
+        buyer_one_original_balance - Uint128::new(5 * 100)
+    );
+
+    // End campaign
+    router.set_block(BlockInfo {
+        height: router.block_info().height,
+        time: router.block_info().time.plus_days(2),
+        chain_id: router.block_info().chain_id,
+    });
+
+    let _ = crowdfund.execute_end_campaign(owner.clone(), &mut router);
+    let summary = crowdfund.query_campaign_summary(&mut router);
+    assert_eq!(summary.current_capital, 5 * 100);
+    assert_eq!(summary.current_stage, CampaignStage::FAILED.to_string());
+
+    // Refund
+    let buyer_one_original_balance = cw20.query_balance(&router, buyer_one.clone());
+    let _ = crowdfund
+        .execute_claim(buyer_one.clone(), &mut router)
+        .unwrap();
+    let buyer_one_balance = cw20.query_balance(&router, buyer_one.clone());
+    assert_eq!(
+        buyer_one_balance,
+        buyer_one_original_balance + Uint128::new(5 * 100)
+    );
+}
+
+fn mock_campaign_config(
+    denom: Asset,
+    token_address: AndrAddr,
+    withdrawal_recipient: Recipient,
+    soft_cap: Option<Uint128>,
+) -> CampaignConfig {
+    CampaignConfig {
+        title: Some("First Crowdfund".to_string()),
+        description: Some("Demo campaign for testing".to_string()),
+        banner: Some("http://<campaign_banner>".to_string()),
+        url: Some("http://<campaign_url>".to_string()),
+        denom,
+        token_address,
+        withdrawal_recipient,
+        soft_cap,
+        hard_cap: None,
     }
+}
 
-    // TODO: FIX VAULT BALANCES
-    // //Check vault balances
+fn mock_recipient_with_invalid_msg(addr: &str) -> Recipient {
+    Recipient::new(addr, Some(encode_binary(b"invalid msg").unwrap()))
+}
 
-    // let balance_one: Vec<Coin> = router
-    //     .wrap()
-    //     .query_wasm_smart(
-    //         vault_one_addr,
-    //         &mock_vault_get_balance(
-    //             AndrAddr::from_string(vault_one_recipient_addr.to_string()),
-    //             None,
-    //             None,
-    //         ),
-    //     )
-    //     .unwrap();
-    // assert!(!balance_one.is_empty());
-    // assert_eq!(balance_one[0], coin(148, "uandr"));
-
-    // let balance_two: Vec<Coin> = router
-    //     .wrap()
-    //     .query_wasm_smart(
-    //         vault_two_addr,
-    //         &mock_vault_get_balance(
-    //             AndrAddr::from_string(vault_two_recipient_addr.to_string()),
-    //             None,
-    //             None,
-    //         ),
-    //     )
-    //     .unwrap();
-    // assert!(!balance_two.is_empty());
-    // assert_eq!(balance_two[0], coin(148, "uandr"));
+fn mock_recipient_with_valid_msg(addr: &str) -> Recipient {
+    Recipient::new(
+        addr,
+        Some(to_json_binary(&mock_splitter_send_msg()).unwrap()),
+    )
 }

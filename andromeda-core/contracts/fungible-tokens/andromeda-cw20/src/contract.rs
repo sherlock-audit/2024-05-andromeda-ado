@@ -1,26 +1,22 @@
-use andromeda_fungible_tokens::cw20::{ExecuteMsg, InstantiateMsg, MigrateMsg, QueryMsg};
+use andromeda_fungible_tokens::cw20::{ExecuteMsg, InstantiateMsg, QueryMsg};
 use andromeda_std::{
-    ado_base::{
-        hooks::AndromedaHook, AndromedaMsg, AndromedaQuery, InstantiateMsg as BaseInstantiateMsg,
-    },
+    ado_base::{AndromedaMsg, AndromedaQuery, InstantiateMsg as BaseInstantiateMsg, MigrateMsg},
     ado_contract::ADOContract,
-    common::Funds,
-    common::{context::ExecuteContext, encode_binary},
-    error::{from_semver, ContractError},
+    amp::AndrAddr,
+    common::{actions::call_action, context::ExecuteContext, encode_binary, Funds},
+    error::ContractError,
 };
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    ensure, from_json, to_json_binary, Addr, Api, Binary, CosmosMsg, Deps, DepsMut, Env,
-    MessageInfo, Response, StdResult, Storage, SubMsg, Uint128, WasmMsg,
+    from_json, to_json_binary, Addr, Api, Binary, CosmosMsg, Deps, DepsMut, Env, MessageInfo,
+    Response, StdResult, Storage, SubMsg, Uint128, WasmMsg,
 };
 
-use cw2::{get_contract_version, set_contract_version};
 use cw20::{Cw20Coin, Cw20ExecuteMsg};
 use cw20_base::{
     contract::{execute as execute_cw20, instantiate as cw20_instantiate, query as cw20_query},
     state::BALANCES,
 };
-use semver::Version;
 
 // version info for migration info
 const CONTRACT_NAME: &str = "crates.io:andromeda-cw20";
@@ -28,34 +24,28 @@ const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn instantiate(
-    deps: DepsMut,
+    mut deps: DepsMut,
     env: Env,
     info: MessageInfo,
     msg: InstantiateMsg,
 ) -> Result<Response, ContractError> {
-    set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
     let contract = ADOContract::default();
+    let cw20_resp = cw20_instantiate(deps.branch(), env.clone(), info.clone(), msg.clone().into())?;
     let resp = contract.instantiate(
         deps.storage,
-        env.clone(),
+        env,
         deps.api,
+        &deps.querier,
         info.clone(),
         BaseInstantiateMsg {
-            ado_type: "cw20".to_string(),
+            ado_type: CONTRACT_NAME.to_string(),
             ado_version: CONTRACT_VERSION.to_string(),
-            operators: None,
-            kernel_address: msg.clone().kernel_address,
+            kernel_address: msg.kernel_address.clone(),
             owner: msg.clone().owner,
         },
     )?;
-    let modules_resp =
-        contract.register_modules(info.sender.as_str(), deps.storage, msg.clone().modules)?;
-
-    let cw20_resp = cw20_instantiate(deps, env, info, msg.into())?;
 
     Ok(resp
-        .add_submessages(modules_resp.messages)
-        .add_attributes(modules_resp.attributes)
         .add_submessages(cw20_resp.messages)
         .add_attributes(cw20_resp.attributes))
 }
@@ -77,27 +67,39 @@ pub fn execute(
     }
 }
 
-pub fn handle_execute(ctx: ExecuteContext, msg: ExecuteMsg) -> Result<Response, ContractError> {
-    let contract = ADOContract::default();
-    if !matches!(msg, ExecuteMsg::UpdateAppContract { .. })
-        && !matches!(msg, ExecuteMsg::UpdateOwner { .. })
-    {
-        contract.module_hook::<Response>(
-            &ctx.deps.as_ref(),
-            AndromedaHook::OnExecute {
-                sender: ctx.info.sender.to_string(),
-                payload: encode_binary(&msg)?,
-            },
-        )?;
-    }
-    match msg {
-        ExecuteMsg::Transfer { recipient, amount } => execute_transfer(ctx, recipient, amount),
+pub fn handle_execute(mut ctx: ExecuteContext, msg: ExecuteMsg) -> Result<Response, ContractError> {
+    let action = msg.as_ref().to_string();
+
+    let _contract = ADOContract::default();
+    let action_response = call_action(
+        &mut ctx.deps,
+        &ctx.info,
+        &ctx.env,
+        &ctx.amp_ctx,
+        msg.as_ref(),
+    )?;
+
+    let res = match msg {
+        ExecuteMsg::Transfer { recipient, amount } => {
+            execute_transfer(ctx, recipient, amount, action)
+        }
+        ExecuteMsg::TransferFrom {
+            owner,
+            recipient,
+            amount,
+        } => execute_transfer_from(ctx, recipient, owner, amount, action),
         ExecuteMsg::Burn { amount } => execute_burn(ctx, amount),
         ExecuteMsg::Send {
             contract,
             amount,
             msg,
-        } => execute_send(ctx, contract, amount, msg),
+        } => execute_send(ctx, contract, amount, msg, action),
+        ExecuteMsg::SendFrom {
+            owner,
+            contract,
+            amount,
+            msg,
+        } => execute_send_from(ctx, contract, amount, msg, action, owner),
         ExecuteMsg::Mint { recipient, amount } => execute_mint(ctx, recipient, amount),
         _ => {
             let serialized = encode_binary(&msg)?;
@@ -106,50 +108,103 @@ pub fn handle_execute(ctx: ExecuteContext, msg: ExecuteMsg) -> Result<Response, 
                 _ => Ok(execute_cw20(ctx.deps, ctx.env, ctx.info, msg.into())?),
             }
         }
-    }
+    }?;
+    Ok(res
+        .add_submessages(action_response.messages)
+        .add_attributes(action_response.attributes)
+        .add_events(action_response.events))
 }
 
 fn execute_transfer(
     ctx: ExecuteContext,
-    recipient: String,
+    recipient: AndrAddr,
     amount: Uint128,
+    action: String,
+) -> Result<Response, ContractError> {
+    handle_transfer(ctx, recipient, None, amount, action, false)
+}
+
+fn execute_transfer_from(
+    ctx: ExecuteContext,
+    recipient: AndrAddr,
+    owner: String,
+    amount: Uint128,
+    action: String,
+) -> Result<Response, ContractError> {
+    handle_transfer(ctx, recipient, Some(owner), amount, action, true)
+}
+
+fn handle_transfer(
+    ctx: ExecuteContext,
+    recipient: AndrAddr,
+    owner: Option<String>,
+    amount: Uint128,
+    action: String,
+    is_transfer_from: bool,
 ) -> Result<Response, ContractError> {
     let ExecuteContext {
         deps, info, env, ..
     } = ctx;
 
-    let (msgs, events, remainder) = ADOContract::default().on_funds_transfer(
-        &deps.as_ref(),
-        info.sender.to_string(),
+    let transfer_response = ADOContract::default().query_deducted_funds(
+        deps.as_ref(),
+        action,
         Funds::Cw20(Cw20Coin {
             address: env.contract.address.to_string(),
             amount,
         }),
-        to_json_binary(&ExecuteMsg::Transfer {
-            amount,
-            recipient: recipient.clone(),
-        })?,
     )?;
+    match transfer_response {
+        Some(transfer_response) => {
+            let remaining_amount = match transfer_response.leftover_funds {
+                Funds::Native(..) => amount, // Handle the case where remaining amount is native funds
+                Funds::Cw20(coin) => coin.amount,
+            };
 
-    let remaining_amount = match remainder {
-        Funds::Native(..) => amount, //What do we do in the case that the rates returns remaining amount as native funds?
-        Funds::Cw20(coin) => coin.amount,
-    };
+            let mut resp = filter_out_cw20_messages(
+                transfer_response.msgs,
+                deps.storage,
+                deps.api,
+                &info.sender,
+            )?;
 
-    let mut resp = filter_out_cw20_messages(msgs, deps.storage, deps.api, &info.sender)?;
+            let recipient = recipient.get_raw_address(&deps.as_ref())?.into_string();
+            let cw20_msg = if is_transfer_from {
+                Cw20ExecuteMsg::TransferFrom {
+                    recipient,
+                    owner: owner.expect("Owner should be provided for TransferFrom"),
+                    amount: remaining_amount,
+                }
+            } else {
+                Cw20ExecuteMsg::Transfer {
+                    recipient,
+                    amount: remaining_amount,
+                }
+            };
 
-    // Continue with standard cw20 operation
-    let cw20_resp = execute_cw20(
-        deps,
-        env,
-        info,
-        Cw20ExecuteMsg::Transfer {
-            recipient,
-            amount: remaining_amount,
-        },
-    )?;
-    resp = resp.add_attributes(cw20_resp.attributes).add_events(events);
-    Ok(resp)
+            let cw20_resp = execute_cw20(deps, env, info, cw20_msg)?;
+            resp = resp
+                .add_submessages(cw20_resp.messages)
+                .add_attributes(cw20_resp.attributes)
+                .add_events(transfer_response.events);
+            Ok(resp)
+        }
+        None => {
+            let recipient = recipient.get_raw_address(&deps.as_ref())?.into_string();
+            let cw20_msg = if is_transfer_from {
+                Cw20ExecuteMsg::TransferFrom {
+                    recipient,
+                    owner: owner.expect("Owner should be provided for TransferFrom"),
+                    amount,
+                }
+            } else {
+                Cw20ExecuteMsg::Transfer { recipient, amount }
+            };
+
+            let cw20_resp = execute_cw20(deps, env, info, cw20_msg)?;
+            Ok(cw20_resp)
+        }
+    }
 }
 
 fn transfer_tokens(
@@ -168,7 +223,9 @@ fn transfer_tokens(
     BALANCES.update(
         storage,
         recipient,
-        |balance: Option<Uint128>| -> StdResult<_> { Ok(balance.unwrap_or_default() + amount) },
+        |balance: Option<Uint128>| -> StdResult<_> {
+            Ok(balance.unwrap_or_default().checked_add(amount)?)
+        },
     )?;
     Ok(())
 }
@@ -188,51 +245,104 @@ fn execute_burn(ctx: ExecuteContext, amount: Uint128) -> Result<Response, Contra
 
 fn execute_send(
     ctx: ExecuteContext,
-    contract: String,
+    contract: AndrAddr,
     amount: Uint128,
     msg: Binary,
+    action: String,
+) -> Result<Response, ContractError> {
+    handle_send(ctx, contract, amount, msg, action, None, false)
+}
+
+fn execute_send_from(
+    ctx: ExecuteContext,
+    contract: AndrAddr,
+    amount: Uint128,
+    msg: Binary,
+    action: String,
+    owner: String,
+) -> Result<Response, ContractError> {
+    handle_send(ctx, contract, amount, msg, action, Some(owner), true)
+}
+
+fn handle_send(
+    ctx: ExecuteContext,
+    contract: AndrAddr,
+    amount: Uint128,
+    msg: Binary,
+    action: String,
+    owner: Option<String>,
+    is_send_from: bool,
 ) -> Result<Response, ContractError> {
     let ExecuteContext {
         deps, info, env, ..
     } = ctx;
 
-    let (msgs, events, remainder) = ADOContract::default().on_funds_transfer(
-        &deps.as_ref(),
-        info.sender.to_string(),
+    let rates_response = ADOContract::default().query_deducted_funds(
+        deps.as_ref(),
+        action,
         Funds::Cw20(Cw20Coin {
             address: env.contract.address.to_string(),
             amount,
         }),
-        to_json_binary(&ExecuteMsg::Send {
-            amount,
-            contract: contract.clone(),
-            msg: msg.clone(),
-        })?,
     )?;
+    match rates_response {
+        Some(rates_response) => {
+            let remaining_amount = match rates_response.leftover_funds {
+                Funds::Native(..) => amount, // Handle the case where remaining amount is native funds
+                Funds::Cw20(coin) => coin.amount,
+            };
 
-    let remaining_amount = match remainder {
-        Funds::Native(..) => amount, //What do we do in the case that the rates returns remaining amount as native funds?
-        Funds::Cw20(coin) => coin.amount,
-    };
+            let mut resp = filter_out_cw20_messages(
+                rates_response.msgs,
+                deps.storage,
+                deps.api,
+                &info.sender,
+            )?;
+            let contract = contract.get_raw_address(&deps.as_ref())?.to_string();
+            let cw20_msg = if is_send_from {
+                Cw20ExecuteMsg::SendFrom {
+                    contract,
+                    amount: remaining_amount,
+                    msg,
+                    owner: owner.expect("Owner should be provided for SendFrom"),
+                }
+            } else {
+                Cw20ExecuteMsg::Send {
+                    contract,
+                    amount: remaining_amount,
+                    msg,
+                }
+            };
 
-    let mut resp = filter_out_cw20_messages(msgs, deps.storage, deps.api, &info.sender)?;
+            let cw20_resp = execute_cw20(deps, env, info, cw20_msg)?;
+            resp = resp
+                .add_submessages(cw20_resp.messages)
+                .add_attributes(cw20_resp.attributes)
+                .add_events(rates_response.events);
 
-    let cw20_resp = execute_cw20(
-        deps,
-        env,
-        info,
-        Cw20ExecuteMsg::Send {
-            contract,
-            amount: remaining_amount,
-            msg,
-        },
-    )?;
-    resp = resp
-        .add_attributes(cw20_resp.attributes)
-        .add_events(events)
-        .add_submessages(cw20_resp.messages);
+            Ok(resp)
+        }
+        None => {
+            let contract = contract.get_raw_address(&deps.as_ref())?.to_string();
+            let cw20_msg = if is_send_from {
+                Cw20ExecuteMsg::SendFrom {
+                    contract,
+                    amount,
+                    msg,
+                    owner: owner.expect("Owner should be provided for SendFrom"),
+                }
+            } else {
+                Cw20ExecuteMsg::Send {
+                    contract,
+                    amount,
+                    msg,
+                }
+            };
 
-    Ok(resp)
+            let cw20_resp = execute_cw20(deps, env, info, cw20_msg)?;
+            Ok(cw20_resp)
+        }
+    }
 }
 
 fn execute_mint(
@@ -280,36 +390,7 @@ fn filter_out_cw20_messages(
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, ContractError> {
-    // New version
-    let version: Version = CONTRACT_VERSION.parse().map_err(from_semver)?;
-
-    // Old version
-    let stored = get_contract_version(deps.storage)?;
-    let storage_version: Version = stored.version.parse().map_err(from_semver)?;
-
-    let contract = ADOContract::default();
-
-    ensure!(
-        stored.contract == CONTRACT_NAME,
-        ContractError::CannotMigrate {
-            previous_contract: stored.contract,
-        }
-    );
-
-    // New version has to be newer/greater than the old version
-    ensure!(
-        storage_version < version,
-        ContractError::CannotMigrate {
-            previous_contract: stored.version,
-        }
-    );
-
-    set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
-
-    // Update the ADOContract's version
-    contract.execute_update_version(deps)?;
-
-    Ok(Response::default())
+    ADOContract::default().migrate(deps, CONTRACT_NAME, CONTRACT_VERSION)
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
