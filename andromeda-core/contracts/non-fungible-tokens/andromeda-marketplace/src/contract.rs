@@ -1,32 +1,39 @@
 use crate::state::{
     read_sale_infos, sale_infos, SaleInfo, TokenSaleState, NEXT_SALE_ID, TOKEN_SALE_STATE,
 };
+use std::vec;
 
 use andromeda_non_fungible_tokens::marketplace::{
-    Cw721HookMsg, ExecuteMsg, InstantiateMsg, MigrateMsg, QueryMsg, SaleIdsResponse,
+    Cw20HookMsg, Cw721HookMsg, ExecuteMsg, InstantiateMsg, QueryMsg, SaleIdsResponse,
     SaleStateResponse, Status,
 };
-use andromeda_std::ado_contract::ADOContract;
-
-use andromeda_std::common::context::ExecuteContext;
-use andromeda_std::common::expiration::{
-    expiration_from_milliseconds, MILLISECONDS_TO_NANOSECONDS_RATIO,
-};
 use andromeda_std::{
-    ado_base::{hooks::AndromedaHook, InstantiateMsg as BaseInstantiateMsg},
-    common::{encode_binary, rates::get_tax_amount, Funds},
-    error::{from_semver, ContractError},
+    ado_base::{
+        permissioning::{LocalPermission, Permission},
+        InstantiateMsg as BaseInstantiateMsg, MigrateMsg,
+    },
+    ado_contract::ADOContract,
+    amp::Recipient,
+    common::{
+        actions::call_action,
+        context::ExecuteContext,
+        denom::{Asset, SEND_CW20_ACTION, SEND_NFT_ACTION},
+        encode_binary,
+        expiration::{expiration_from_milliseconds, get_and_validate_start_time, Expiry},
+        rates::{get_tax_amount, get_tax_amount_cw20},
+        Funds, Milliseconds, MillisecondsDuration,
+    },
+    error::ContractError,
 };
-use cw2::{get_contract_version, set_contract_version};
+
+use cw20::{Cw20Coin, Cw20ReceiveMsg};
 use cw721::{Cw721ExecuteMsg, Cw721QueryMsg, Cw721ReceiveMsg, OwnerOfResponse};
-use semver::Version;
 
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    attr, ensure, from_json, has_coins, BankMsg, Binary, Coin, CosmosMsg, Deps, DepsMut, Env,
-    MessageInfo, QuerierWrapper, QueryRequest, Response, Storage, SubMsg, Uint128, WasmMsg,
-    WasmQuery,
+    attr, coin, ensure, from_json, Addr, Binary, Coin, CosmosMsg, Deps, DepsMut, Env, MessageInfo,
+    QuerierWrapper, QueryRequest, Response, Storage, SubMsg, Uint128, WasmMsg, WasmQuery,
 };
 
 use cw_utils::{nonpayable, Expiration};
@@ -41,27 +48,49 @@ pub fn instantiate(
     info: MessageInfo,
     msg: InstantiateMsg,
 ) -> Result<Response, ContractError> {
-    set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
     NEXT_SALE_ID.save(deps.storage, &Uint128::from(1u128))?;
     let inst_resp = ADOContract::default().instantiate(
         deps.storage,
         env,
         deps.api,
-        info.clone(),
+        &deps.querier,
+        info,
         BaseInstantiateMsg {
-            ado_type: "marketplace".to_string(),
+            ado_type: CONTRACT_NAME.to_string(),
             ado_version: CONTRACT_VERSION.to_string(),
-            operators: None,
             kernel_address: msg.kernel_address,
             owner: msg.owner,
         },
     )?;
-    let mod_resp =
-        ADOContract::default().register_modules(info.sender.as_str(), deps.storage, msg.modules)?;
 
-    Ok(inst_resp
-        .add_attributes(mod_resp.attributes)
-        .add_submessages(mod_resp.messages))
+    if let Some(authorized_token_addresses) = msg.authorized_token_addresses {
+        if !authorized_token_addresses.is_empty() {
+            ADOContract::default().permission_action(SEND_NFT_ACTION, deps.storage)?;
+        }
+
+        for token_address in authorized_token_addresses {
+            let addr = token_address.get_raw_address(&deps.as_ref())?;
+            ADOContract::set_permission(
+                deps.storage,
+                SEND_NFT_ACTION,
+                addr,
+                Permission::Local(LocalPermission::Whitelisted(None)),
+            )?;
+        }
+    }
+
+    if let Some(authorized_cw20_address) = msg.authorized_cw20_address {
+        ADOContract::default().permission_action(SEND_CW20_ACTION, deps.storage)?;
+        let addr = authorized_cw20_address.get_raw_address(&deps.as_ref())?;
+        ADOContract::set_permission(
+            deps.storage,
+            SEND_CW20_ACTION,
+            addr,
+            Permission::Local(LocalPermission::Whitelisted(None)),
+        )?;
+    }
+
+    Ok(inst_resp)
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
@@ -71,20 +100,6 @@ pub fn execute(
     info: MessageInfo,
     msg: ExecuteMsg,
 ) -> Result<Response, ContractError> {
-    let contract = ADOContract::default();
-
-    if !matches!(msg, ExecuteMsg::UpdateAppContract { .. })
-        && !matches!(msg, ExecuteMsg::UpdateOwner { .. })
-    {
-        contract.module_hook::<Response>(
-            &deps.as_ref(),
-            AndromedaHook::OnExecute {
-                sender: info.sender.to_string(),
-                payload: encode_binary(&msg)?,
-            },
-        )?;
-    }
-
     let ctx = ExecuteContext::new(deps, info, env);
 
     match msg {
@@ -95,34 +110,52 @@ pub fn execute(
     }
 }
 
-pub fn handle_execute(ctx: ExecuteContext, msg: ExecuteMsg) -> Result<Response, ContractError> {
-    match msg {
+pub fn handle_execute(mut ctx: ExecuteContext, msg: ExecuteMsg) -> Result<Response, ContractError> {
+    let action = msg.as_ref().to_string();
+
+    let action_response = call_action(
+        &mut ctx.deps,
+        &ctx.info,
+        &ctx.env,
+        &ctx.amp_ctx,
+        msg.as_ref(),
+    )?;
+    let res = match msg {
         ExecuteMsg::ReceiveNft(msg) => handle_receive_cw721(ctx, msg),
+        ExecuteMsg::Receive(msg) => handle_receive_cw20(ctx, msg),
         ExecuteMsg::UpdateSale {
             token_id,
             token_address,
             coin_denom,
             price,
-        } => execute_update_sale(ctx, token_id, token_address, price, coin_denom),
+            recipient,
+        } => execute_update_sale(ctx, token_id, token_address, price, coin_denom, recipient),
         ExecuteMsg::Buy {
             token_id,
             token_address,
-        } => execute_buy(ctx, token_id, token_address),
+        } => execute_buy(ctx, token_id, token_address, action),
         ExecuteMsg::CancelSale {
             token_id,
             token_address,
         } => execute_cancel(ctx, token_id, token_address),
         _ => ADOContract::default().execute(ctx, msg),
-    }
+    }?;
+    Ok(res
+        .add_submessages(action_response.messages)
+        .add_attributes(action_response.attributes)
+        .add_events(action_response.events))
 }
 
 fn handle_receive_cw721(
-    ctx: ExecuteContext,
+    mut ctx: ExecuteContext,
     msg: Cw721ReceiveMsg,
 ) -> Result<Response, ContractError> {
-    let ExecuteContext {
-        deps, info, env, ..
-    } = ctx;
+    ADOContract::default().is_permissioned(
+        ctx.deps.branch(),
+        ctx.env.clone(),
+        SEND_NFT_ACTION,
+        ctx.info.sender.clone(),
+    )?;
 
     match from_json(&msg.msg)? {
         Cw721HookMsg::StartSale {
@@ -130,60 +163,96 @@ fn handle_receive_cw721(
             coin_denom,
             start_time,
             duration,
+            recipient,
         } => execute_start_sale(
-            deps,
-            env,
+            ctx.deps,
+            ctx.env,
             msg.sender,
             msg.token_id,
-            info.sender.to_string(),
+            ctx.info.sender.to_string(),
             price,
-            coin_denom,
             start_time,
+            coin_denom,
             duration,
+            recipient,
+        ),
+    }
+}
+
+pub fn handle_receive_cw20(
+    mut ctx: ExecuteContext,
+    receive_msg: Cw20ReceiveMsg,
+) -> Result<Response, ContractError> {
+    ADOContract::default().is_permissioned(
+        ctx.deps.branch(),
+        ctx.env.clone(),
+        SEND_CW20_ACTION,
+        ctx.info.sender.clone(),
+    )?;
+    let ExecuteContext { ref info, .. } = ctx;
+    nonpayable(info)?;
+
+    let asset_sent = info.sender.clone();
+    let amount_sent = receive_msg.amount;
+    let sender = receive_msg.sender;
+
+    ensure!(
+        !amount_sent.is_zero(),
+        ContractError::InvalidFunds {
+            msg: "Cannot send a 0 amount".to_string()
+        }
+    );
+
+    match from_json(&receive_msg.msg)? {
+        Cw20HookMsg::Buy {
+            token_id,
+            token_address,
+        } => execute_buy_cw20(
+            ctx,
+            token_id,
+            token_address,
+            amount_sent,
+            asset_sent,
+            &sender,
+            "Buy".to_string(),
         ),
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn execute_start_sale(
-    deps: DepsMut,
+    mut deps: DepsMut,
     env: Env,
     sender: String,
     token_id: String,
     token_address: String,
     price: Uint128,
-    coin_denom: String,
-    start_time: Option<u64>,
-    duration: Option<u64>,
+    start_time: Option<Expiry>,
+    coin_denom: Asset,
+    duration: Option<MillisecondsDuration>,
+    recipient: Option<Recipient>,
 ) -> Result<Response, ContractError> {
+    let (coin_denom, uses_cw20) = coin_denom.get_verified_asset(deps.branch(), env.clone())?;
+
     // Price can't be zero
     ensure!(price > Uint128::zero(), ContractError::InvalidZeroAmount {});
-    let current_time = env.block.time.nanos() / MILLISECONDS_TO_NANOSECONDS_RATIO;
-    // If start time wasn't provided, it will be set as the current_time
-    let start_expiration = if let Some(start_time) = start_time {
-        expiration_from_milliseconds(start_time)?
-    } else {
-        expiration_from_milliseconds(current_time)?
-    };
 
-    // If no duration is provided, the exipration will be set as Never
+    // If start time wasn't provided, it will be set as the current_time
+    let (start_expiration, _current_time) = get_and_validate_start_time(&env, start_time.clone())?;
+
     let end_expiration = if let Some(duration) = duration {
-        expiration_from_milliseconds(start_time.unwrap_or(current_time) + duration)?
+        ensure!(!duration.is_zero(), ContractError::InvalidExpiration {});
+        expiration_from_milliseconds(
+            start_time
+                // If start time isn't provided, it is set one second in advance from the current time
+                .unwrap_or(Expiry::FromNow(Milliseconds::from_seconds(1)))
+                .get_time(&env.block)
+                .plus_milliseconds(duration),
+        )?
     } else {
+        // If no duration is provided, the exipration will be set as Never
         Expiration::Never {}
     };
-
-    // To guard against misleading start times
-    // Subtracting one second from the current block because the unit tests fail otherwise. The current time slightly differed from the block time.
-    let recent_past_timestamp = env.block.time.minus_seconds(1);
-    let recent_past_expiration = expiration_from_milliseconds(recent_past_timestamp.seconds())?;
-    ensure!(
-        start_expiration.gt(&recent_past_expiration),
-        ContractError::StartTimeInThePast {
-            current_time: env.block.time.nanos() / MILLISECONDS_TO_NANOSECONDS_RATIO,
-            current_block: env.block.height,
-        }
-    );
 
     let sale_id = get_and_increment_next_sale_id(deps.storage, &token_id, &token_address)?;
 
@@ -200,6 +269,8 @@ fn execute_start_sale(
             status: Status::Open,
             start_time: start_expiration,
             end_time: end_expiration,
+            uses_cw20,
+            recipient,
         },
     )?;
     Ok(Response::new().add_attributes(vec![
@@ -212,6 +283,7 @@ fn execute_start_sale(
         attr("token_address", token_address),
         attr("start_time", start_expiration.to_string()),
         attr("end_time", end_expiration.to_string()),
+        attr("uses_cw20", uses_cw20.to_string()),
     ]))
 }
 
@@ -221,16 +293,22 @@ fn execute_update_sale(
     token_id: String,
     token_address: String,
     price: Uint128,
-    coin_denom: String,
+    coin_denom: Asset,
+    recipient: Option<Recipient>,
 ) -> Result<Response, ContractError> {
-    let ExecuteContext { deps, info, .. } = ctx;
-
+    let ExecuteContext {
+        mut deps,
+        env,
+        info,
+        ..
+    } = ctx;
+    let (coin_denom, uses_cw20) = coin_denom.get_verified_asset(deps.branch(), env)?;
     nonpayable(&info)?;
 
     let mut token_sale_state =
         get_existing_token_sale_state(deps.storage, &token_id, &token_address)?;
-    // Only token owner is authorized to update the sale
 
+    // Only token owner is authorized to update the sale
     ensure!(
         info.sender == token_sale_state.owner,
         ContractError::Unauthorized {}
@@ -241,6 +319,8 @@ fn execute_update_sale(
 
     token_sale_state.price = price;
     token_sale_state.coin_denom = coin_denom.clone();
+    token_sale_state.uses_cw20 = uses_cw20;
+    token_sale_state.recipient = recipient;
     TOKEN_SALE_STATE.save(
         deps.storage,
         token_sale_state.sale_id.u128(),
@@ -250,6 +330,7 @@ fn execute_update_sale(
         attr("action", "update_sale"),
         attr("coin_denom", coin_denom),
         attr("price", price),
+        attr("uses_cw20", uses_cw20.to_string()),
         attr("sale_id", token_sale_state.sale_id.to_string()),
         attr("token_id", token_id),
         attr("token_address", token_address),
@@ -260,12 +341,10 @@ fn execute_buy(
     ctx: ExecuteContext,
     token_id: String,
     token_address: String,
+    action: String,
 ) -> Result<Response, ContractError> {
     let ExecuteContext {
-        mut deps,
-        info,
-        env,
-        ..
+        deps, info, env, ..
     } = ctx;
 
     let mut token_sale_state =
@@ -302,7 +381,7 @@ fn execute_buy(
     ensure!(
         info.funds.len() == 1,
         ContractError::InvalidFunds {
-            msg: "Sales ensure! exactly one coin to be sent.".to_string(),
+            msg: "One coin should be sent.".to_string(),
         }
     );
 
@@ -320,6 +399,12 @@ fn execute_buy(
     );
 
     let coin_denom = token_sale_state.coin_denom.clone();
+    ensure!(
+        !token_sale_state.uses_cw20,
+        ContractError::InvalidFunds {
+            msg: "Native funds were sent to a sale that only accepts cw20".to_string()
+        }
+    );
     let payment: &Coin = &info.funds[0];
 
     // Make sure funds are equal to the price and in the correct denomination
@@ -329,9 +414,13 @@ fn execute_buy(
             msg: format!("No {coin_denom} assets are provided to sale"),
         }
     );
+
+    let price = token_sale_state.price;
     ensure!(
-        payment.amount >= token_sale_state.price,
-        ContractError::InsufficientFunds {}
+        payment.amount >= price,
+        ContractError::InvalidFunds {
+            msg: format!("The funds sent don't match the price {price}"),
+        }
     );
 
     // Change sale status from Open to Executed
@@ -340,15 +429,17 @@ fn execute_buy(
     TOKEN_SALE_STATE.save(deps.storage, key, &token_sale_state)?;
 
     // Calculate the funds to be received after tax
-    let after_tax_payment = purchase_token(&mut deps, &info, token_sale_state.clone())?;
+    let (after_tax_payment, tax_messages) = purchase_token(
+        deps.as_ref(),
+        &info,
+        None,
+        token_sale_state.clone(),
+        action.clone(),
+    )?;
 
-    Ok(Response::new()
-        .add_submessages(after_tax_payment.1)
-        // Send funds to the original owner.
-        .add_message(CosmosMsg::Bank(BankMsg::Send {
-            to_address: token_sale_state.owner,
-            amount: vec![after_tax_payment.0],
-        }))
+    let mut resp = Response::new()
+        // Send tax/royalty messages
+        .add_submessages(tax_messages)
         // Send NFT to buyer.
         .add_message(CosmosMsg::Wasm(WasmMsg::Execute {
             contract_addr: token_sale_state.token_address.clone(),
@@ -362,7 +453,163 @@ fn execute_buy(
         .add_attribute("token_id", token_id)
         .add_attribute("token_contract", token_sale_state.token_address)
         .add_attribute("recipient", info.sender.to_string())
-        .add_attribute("sale_id", token_sale_state.sale_id))
+        .add_attribute("sale_id", token_sale_state.sale_id);
+    // Marketplace recipient's funds
+    let sale_recipient_funds = after_tax_payment.try_get_coin()?;
+
+    // It could be zero if the royalties are 100% of the sale price
+    if !sale_recipient_funds.amount.is_zero() {
+        // Get sale recipient's address
+        let recipient = token_sale_state
+            .recipient
+            .unwrap_or(Recipient::from_string(token_sale_state.owner));
+
+        // Send payment to recipient
+        resp = resp.add_submessage(
+            recipient.generate_direct_msg(&deps.as_ref(), vec![sale_recipient_funds])?,
+        )
+    }
+    Ok(resp)
+}
+
+fn execute_buy_cw20(
+    ctx: ExecuteContext,
+    token_id: String,
+    token_address: String,
+    amount_sent: Uint128,
+    asset_sent: Addr,
+    // The user who sent the cw20
+    sender: &str,
+    action: String,
+) -> Result<Response, ContractError> {
+    let ExecuteContext {
+        mut deps,
+        info,
+        env,
+        ..
+    } = ctx;
+
+    let mut token_sale_state =
+        get_existing_token_sale_state(deps.storage, &token_id, &token_address)?;
+
+    let key = token_sale_state.sale_id.u128();
+
+    match token_sale_state.status {
+        Status::Open => {
+            // Make sure the end time isn't expired, if it is we'll return an error and change the Status to expired in case if it's set as Open or Pending
+            ensure!(
+                !token_sale_state.end_time.is_expired(&env.block),
+                ContractError::SaleExpired {}
+            );
+
+            // If start time hasn't expired, it means that the sale hasn't started yet.
+            ensure!(
+                token_sale_state.start_time.is_expired(&env.block),
+                ContractError::SaleNotOpen {}
+            );
+        }
+        Status::Expired => return Err(ContractError::SaleExpired {}),
+        Status::Executed => return Err(ContractError::SaleExecuted {}),
+        Status::Cancelled => return Err(ContractError::SaleCancelled {}),
+    }
+
+    // The owner can't buy his own NFT
+    ensure!(
+        token_sale_state.owner != sender,
+        ContractError::TokenOwnerCannotBuy {}
+    );
+
+    let token_owner = query_owner_of(
+        deps.querier,
+        token_sale_state.token_address.clone(),
+        token_id.clone(),
+    )?
+    .owner;
+    ensure!(
+        // If this is false then the token is no longer held by the contract so the token has been
+        // claimed.
+        token_owner == env.contract.address,
+        ContractError::SaleAlreadyConducted {}
+    );
+
+    let is_cw20_sale = token_sale_state.uses_cw20;
+    ensure!(
+        is_cw20_sale,
+        ContractError::InvalidFunds {
+            msg: "CW20 funds were sent to a sale that only accepts native funds".to_string()
+        }
+    );
+
+    let sale_currency = token_sale_state.coin_denom.clone();
+    let valid_cw20_sale = ADOContract::default()
+        .is_permissioned(deps.branch(), env, SEND_CW20_ACTION, sale_currency.clone())
+        .is_ok();
+    ensure!(
+        valid_cw20_sale,
+        ContractError::InvalidAsset {
+            asset: asset_sent.to_string()
+        }
+    );
+
+    let payment: &Coin = &coin(amount_sent.u128(), asset_sent.to_string());
+
+    // Make sure funds are equal to the price and in the correct denomination
+    ensure!(
+        payment.denom == sale_currency,
+        ContractError::InvalidFunds {
+            msg: format!("No {sale_currency} assets are provided to sale"),
+        }
+    );
+
+    // Change sale status from Open to Executed
+    token_sale_state.status = Status::Executed;
+
+    TOKEN_SALE_STATE.save(deps.storage, key, &token_sale_state)?;
+
+    // Calculate the funds to be received after tax
+    let (after_tax_payment, tax_messages) = purchase_token(
+        deps.as_ref(),
+        &info,
+        Some(amount_sent),
+        token_sale_state.clone(),
+        action,
+    )?;
+
+    let mut resp: Response = Response::new()
+        // Send tax/royalty messages
+        .add_submessages(tax_messages)
+        // Send NFT to buyer.
+        .add_message(CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: token_sale_state.token_address.clone(),
+            msg: encode_binary(&Cw721ExecuteMsg::TransferNft {
+                recipient: sender.to_string(),
+                token_id: token_id.clone(),
+            })?,
+            funds: vec![],
+        }))
+        .add_attribute("action", "buy")
+        .add_attribute("token_id", token_id)
+        .add_attribute("token_contract", token_sale_state.token_address)
+        .add_attribute("recipient", sender.to_string())
+        .add_attribute("sale_id", token_sale_state.sale_id);
+
+    match after_tax_payment {
+        Funds::Cw20(cw20_after_tax_payment) => {
+            if !cw20_after_tax_payment.amount.is_zero() {
+                // Get sale recipient's address
+                let recipient = token_sale_state
+                    .recipient
+                    .unwrap_or(Recipient::from_string(token_sale_state.owner));
+                // Send payment to recipient
+                resp = resp.add_submessage(
+                    recipient.generate_msg_cw20(&deps.as_ref(), cw20_after_tax_payment)?,
+                );
+            }
+        }
+        Funds::Native(_) => {}
+    }
+
+    Ok(resp)
 }
 
 fn execute_cancel(
@@ -414,42 +661,100 @@ fn execute_cancel(
 }
 
 fn purchase_token(
-    deps: &mut DepsMut,
+    deps: Deps,
     info: &MessageInfo,
+    amount_sent: Option<Uint128>,
     state: TokenSaleState,
-) -> Result<(Coin, Vec<SubMsg>), ContractError> {
-    let total_cost = Coin::new(state.price.u128(), state.coin_denom.clone());
+    action: String,
+) -> Result<(Funds, Vec<SubMsg>), ContractError> {
+    // Handle cw20 case
+    if let Some(amount_sent) = amount_sent {
+        let total_cost = Cw20Coin {
+            address: state.coin_denom.clone(),
+            amount: state.price,
+        };
+        let rates_response = ADOContract::default().query_deducted_funds(
+            deps,
+            action.clone(),
+            Funds::Cw20(total_cost),
+        )?;
+        match rates_response {
+            Some(rates_response) => {
+                let remaining_amount = rates_response.leftover_funds.try_get_cw20_coin()?;
+                let tax_amount =
+                    get_tax_amount_cw20(&rates_response.msgs, state.price, remaining_amount.amount);
+                let total_required_payment = state.price.checked_add(tax_amount)?;
 
-    let mut total_tax_amount = Uint128::zero();
+                // Check that enough funds were sent to cover the required payment
+                ensure!(
+                    amount_sent.eq(&total_required_payment),
+                    ContractError::InvalidFunds {
+                        msg: format!(
+                            "Invalid funds provided, expected: {}, received: {}",
+                            total_required_payment, amount_sent
+                        )
+                    }
+                );
+                let after_tax_payment = Cw20Coin {
+                    address: state.clone().coin_denom,
+                    amount: remaining_amount.amount,
+                };
+                Ok((Funds::Cw20(after_tax_payment), rates_response.msgs))
+            }
+            // No rates response means that there's no tax
+            None => {
+                let payment = Cw20Coin {
+                    address: state.coin_denom,
+                    amount: state.price,
+                };
 
-    let (msgs, _events, remainder) = ADOContract::default().on_funds_transfer(
-        &deps.as_ref(),
-        info.sender.to_string(),
-        Funds::Native(total_cost),
-        encode_binary(&"")?,
-    )?;
+                Ok((Funds::Cw20(payment), vec![]))
+            }
+        }
+        // Handle native funds case
+    } else {
+        let total_cost = Coin::new(state.price.u128(), state.coin_denom.clone());
+        let rates_response = ADOContract::default().query_deducted_funds(
+            deps,
+            action,
+            Funds::Native(total_cost.clone()),
+        )?;
+        match rates_response {
+            Some(rates_response) => {
+                let remaining_amount = rates_response.leftover_funds.try_get_coin()?;
+                let tax_amount =
+                    get_tax_amount(&rates_response.msgs, state.price, remaining_amount.amount);
 
-    let remaining_amount = remainder.try_get_coin()?;
+                let total_required_payment = state.price.checked_add(tax_amount)?;
 
-    let tax_amount = get_tax_amount(&msgs, state.price, remaining_amount.amount);
+                // Check that enough funds were sent to cover the required payment
+                let amount_sent = info.funds[0].amount.u128();
+                ensure!(
+                    amount_sent.eq(&total_required_payment.u128()),
+                    ContractError::InvalidFunds {
+                        msg: format!(
+                            "Invalid funds provided, expected: {}, received: {}",
+                            total_required_payment, amount_sent
+                        )
+                    }
+                );
 
-    // Calculate total tax
-    total_tax_amount += tax_amount;
+                let after_tax_payment = Coin {
+                    denom: state.clone().coin_denom,
+                    amount: remaining_amount.amount,
+                };
 
-    let required_payment = Coin {
-        denom: state.coin_denom.clone(),
-        amount: state.price + total_tax_amount,
-    };
-    ensure!(
-        has_coins(&info.funds, &required_payment),
-        ContractError::InsufficientFunds {}
-    );
-
-    let after_tax_payment = Coin {
-        denom: state.coin_denom,
-        amount: remaining_amount.amount,
-    };
-    Ok((after_tax_payment, msgs))
+                Ok((Funds::Native(after_tax_payment), rates_response.msgs))
+            }
+            None => {
+                let payment = Coin {
+                    denom: state.coin_denom,
+                    amount: state.price,
+                };
+                Ok((Funds::Native(payment), vec![]))
+            }
+        }
+    }
 }
 
 fn get_existing_token_sale_state(
@@ -574,472 +879,5 @@ fn query_owner_of(
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, ContractError> {
-    // New version
-    let version: Version = CONTRACT_VERSION.parse().map_err(from_semver)?;
-
-    // Old version
-    let stored = get_contract_version(deps.storage)?;
-    let storage_version: Version = stored.version.parse().map_err(from_semver)?;
-
-    let contract = ADOContract::default();
-
-    ensure!(
-        stored.contract == CONTRACT_NAME,
-        ContractError::CannotMigrate {
-            previous_contract: stored.contract,
-        }
-    );
-
-    // New version has to be newer/greater than the old version
-    ensure!(
-        storage_version < version,
-        ContractError::CannotMigrate {
-            previous_contract: stored.version,
-        }
-    );
-
-    set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
-
-    // Update the ADOContract's version
-    contract.execute_update_version(deps)?;
-
-    Ok(Response::default())
+    ADOContract::default().migrate(deps, CONTRACT_NAME, CONTRACT_VERSION)
 }
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use crate::mock_querier::{
-//         mock_dependencies_custom, MOCK_RATES_CONTRACT, MOCK_TOKEN_ADDR, MOCK_TOKEN_OWNER,
-//         MOCK_UNCLAIMED_TOKEN,
-//     };
-//     use crate::state::SaleInfo;
-//     use andromeda_non_fungible_tokens::marketplace::{Cw721HookMsg, ExecuteMsg, InstantiateMsg};
-
-//     use common::ado_base::modules::{Module, RATES};
-//     use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
-//     use cosmwasm_std::{coin, coins};
-
-//     fn start_sale(deps: DepsMut) {
-//         let hook_msg = Cw721HookMsg::StartSale {
-//             coin_denom: "uusd".to_string(),
-//             price: Uint128::new(100),
-//         };
-//         let msg = ExecuteMsg::ReceiveNft(Cw721ReceiveMsg {
-//             sender: MOCK_TOKEN_OWNER.to_owned(),
-//             token_id: MOCK_UNCLAIMED_TOKEN.to_owned(),
-//             msg: encode_binary(&hook_msg).unwrap(),
-//         });
-//         let env = mock_env();
-
-//         let info = mock_info(MOCK_TOKEN_ADDR, &[]);
-//         let _res = execute(deps, env, info, msg).unwrap();
-//     }
-
-//     fn assert_sale_created(deps: Deps) {
-//         assert_eq!(
-//             TokenSaleState {
-//                 coin_denom: "uusd".to_string(),
-//                 sale_id: 1u128.into(),
-//                 owner: MOCK_TOKEN_OWNER.to_string(),
-//                 token_id: MOCK_UNCLAIMED_TOKEN.to_owned(),
-//                 token_address: MOCK_TOKEN_ADDR.to_owned(),
-//                 status: Status::Open,
-//                 price: Uint128::new(100)
-//             },
-//             TOKEN_SALE_STATE.load(deps.storage, 1u128).unwrap()
-//         );
-
-//         assert_eq!(
-//             SaleInfo {
-//                 sale_ids: vec![Uint128::from(1u128)],
-//                 token_address: MOCK_TOKEN_ADDR.to_owned(),
-//                 token_id: MOCK_UNCLAIMED_TOKEN.to_owned(),
-//             },
-//             sale_infos()
-//                 .load(
-//                     deps.storage,
-//                     &(MOCK_UNCLAIMED_TOKEN.to_owned() + MOCK_TOKEN_ADDR)
-//                 )
-//                 .unwrap()
-//         );
-//     }
-
-//     #[test]
-//     fn test_sale_instantiate() {
-//         let owner = "creator";
-//         let mut deps = mock_dependencies();
-//         let env = mock_env();
-//         let info = mock_info(owner, &[]);
-//         let msg = InstantiateMsg {
-//             modules: None,
-//             kernel_address: None,
-//         };
-//         let res = instantiate(deps.as_mut(), env, info, msg).unwrap();
-//         assert_eq!(0, res.messages.len());
-//     }
-
-//     #[test]
-//     fn test_execute_buy_non_existing_sale() {
-//         let mut deps = mock_dependencies_custom(&[]);
-//         let env = mock_env();
-//         let info = mock_info(MOCK_TOKEN_OWNER, &[]);
-//         let msg = InstantiateMsg {
-//             modules: None,
-//             kernel_address: None,
-//         };
-//         let _res = instantiate(deps.as_mut(), env.clone(), info, msg).unwrap();
-
-//         let msg = ExecuteMsg::Buy {
-//             token_id: MOCK_UNCLAIMED_TOKEN.to_string(),
-//             token_address: MOCK_TOKEN_ADDR.to_string(),
-//         };
-//         let info = mock_info("buyer", &coins(100, "uusd"));
-//         let res = execute(deps.as_mut(), env, info, msg);
-//         assert_eq!(ContractError::SaleDoesNotExist {}, res.unwrap_err());
-//     }
-
-//     #[test]
-//     fn execute_buy_sale_not_open_already_bought() {
-//         let mut deps = mock_dependencies_custom(&[]);
-//         let env = mock_env();
-//         let info = mock_info(MOCK_TOKEN_OWNER, &[]);
-//         let msg = InstantiateMsg {
-//             modules: None,
-//             kernel_address: None,
-//         };
-//         let _res = instantiate(deps.as_mut(), env.clone(), info, msg).unwrap();
-
-//         start_sale(deps.as_mut());
-//         assert_sale_created(deps.as_ref());
-
-//         let msg = ExecuteMsg::Buy {
-//             token_id: MOCK_UNCLAIMED_TOKEN.to_owned(),
-//             token_address: MOCK_TOKEN_ADDR.to_string(),
-//         };
-
-//         let info = mock_info("sender", &coins(100, "uusd".to_string()));
-//         let _res = execute(deps.as_mut(), env.clone(), info, msg).unwrap();
-
-//         let msg = ExecuteMsg::Buy {
-//             token_id: MOCK_UNCLAIMED_TOKEN.to_owned(),
-//             token_address: MOCK_TOKEN_ADDR.to_string(),
-//         };
-
-//         let info = mock_info("sender", &coins(100, "uusd".to_string()));
-//         let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
-//         assert_eq!(err, ContractError::SaleNotOpen {})
-//     }
-
-//     #[test]
-//     fn execute_buy_sale_not_open_cancelled() {
-//         let mut deps = mock_dependencies_custom(&[]);
-//         let env = mock_env();
-//         let info = mock_info(MOCK_TOKEN_OWNER, &[]);
-//         let msg = InstantiateMsg {
-//             modules: None,
-//             kernel_address: None,
-//         };
-//         let _res = instantiate(deps.as_mut(), env.clone(), info, msg).unwrap();
-
-//         start_sale(deps.as_mut());
-//         assert_sale_created(deps.as_ref());
-
-//         let msg = ExecuteMsg::CancelSale {
-//             token_id: MOCK_UNCLAIMED_TOKEN.to_owned(),
-//             token_address: MOCK_TOKEN_ADDR.to_string(),
-//         };
-
-//         let info = mock_info(MOCK_TOKEN_OWNER, &[]);
-//         let _res = execute(deps.as_mut(), env.clone(), info, msg).unwrap();
-
-//         let msg = ExecuteMsg::Buy {
-//             token_id: MOCK_UNCLAIMED_TOKEN.to_owned(),
-//             token_address: MOCK_TOKEN_ADDR.to_string(),
-//         };
-//         let info = mock_info("sender", &coins(100, "uusd".to_string()));
-//         let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
-//         assert_eq!(err, ContractError::SaleNotOpen {})
-//     }
-
-//     #[test]
-//     fn execute_buy_token_owner_cannot_buy() {
-//         let mut deps = mock_dependencies_custom(&[]);
-//         let env = mock_env();
-//         let info = mock_info("owner", &[]);
-//         let msg = InstantiateMsg {
-//             modules: None,
-//             kernel_address: None,
-//         };
-//         let _res = instantiate(deps.as_mut(), env.clone(), info, msg).unwrap();
-
-//         start_sale(deps.as_mut());
-//         assert_sale_created(deps.as_ref());
-
-//         let msg = ExecuteMsg::Buy {
-//             token_id: MOCK_UNCLAIMED_TOKEN.to_owned(),
-//             token_address: MOCK_TOKEN_ADDR.to_string(),
-//         };
-
-//         let info = mock_info(MOCK_TOKEN_OWNER, &coins(100, "uusd".to_string()));
-//         let res = execute(deps.as_mut(), env, info, msg);
-//         assert_eq!(ContractError::TokenOwnerCannotBuy {}, res.unwrap_err());
-//     }
-
-//     // #[test]
-//     // fn execute_buy_whitelist() {
-//     //     let mut deps = mock_dependencies_custom(&[]);
-//     //     let env = mock_env();
-//     //     let info = mock_info("owner", &[]);
-//     //     let msg = InstantiateMsg {
-//     //     let _res = instantiate(deps.as_mut(), env.clone(), info, msg).unwrap();
-
-//     //     start_sale(deps.as_mut(), Some(vec![Addr::unchecked("sender")]));
-//     //     assert_sale_created(deps.as_ref(), Some(vec![Addr::unchecked("sender")]));
-
-//     //     let msg = ExecuteMsg::Buy {
-//     //         token_id: MOCK_UNCLAIMED_TOKEN.to_owned(),
-//     //         token_address: MOCK_TOKEN_ADDR.to_string(),
-//     //     };
-
-//     //     let info = mock_info("not_sender", &coins(100, "uusd".to_string()));
-//     //     let res = execute(deps.as_mut(), env.clone(), info, msg.clone());
-//     //     assert_eq!(ContractError::Unauthorized {}, res.unwrap_err());
-
-//     //     let info = mock_info("sender", &coins(100, "uusd".to_string()));
-//     //     let _res = execute(deps.as_mut(), env, info, msg).unwrap();
-//     // }
-
-//     #[test]
-//     fn execute_buy_invalid_coins_sent() {
-//         let mut deps = mock_dependencies_custom(&[]);
-//         let env = mock_env();
-//         let info = mock_info("owner", &[]);
-//         let msg = InstantiateMsg {
-//             modules: None,
-//             kernel_address: None,
-//         };
-//         let _res = instantiate(deps.as_mut(), env.clone(), info, msg).unwrap();
-
-//         start_sale(deps.as_mut());
-//         assert_sale_created(deps.as_ref());
-
-//         let error = ContractError::InvalidFunds {
-//             msg: "Sales ensure! exactly one coin to be sent.".to_string(),
-//         };
-//         let msg = ExecuteMsg::Buy {
-//             token_id: MOCK_UNCLAIMED_TOKEN.to_string(),
-//             token_address: MOCK_TOKEN_ADDR.to_string(),
-//         };
-
-//         // No coins sent
-//         let info = mock_info("sender", &[]);
-//         let res = execute(deps.as_mut(), env.clone(), info, msg.clone());
-//         assert_eq!(error, res.unwrap_err());
-
-//         // Multiple coins sent
-//         let info = mock_info("sender", &[coin(100, "uusd"), coin(100, "uluna")]);
-//         let res = execute(deps.as_mut(), env.clone(), info, msg.clone());
-//         assert_eq!(error, res.unwrap_err());
-
-//         // Invalid denom sent
-//         let info = mock_info("sender", &[coin(100, "uluna")]);
-//         let res = execute(deps.as_mut(), env.clone(), info, msg.clone());
-//         assert_eq!(
-//             ContractError::InvalidFunds {
-//                 msg: "No uusd assets are provided to sale".to_string(),
-//             },
-//             res.unwrap_err()
-//         );
-
-//         // Correct denom but empty
-//         let info = mock_info("sender", &[coin(0, "uusd")]);
-//         let res = execute(deps.as_mut(), env, info, msg);
-//         assert_eq!(ContractError::InsufficientFunds {}, res.unwrap_err());
-//     }
-
-//     #[test]
-//     fn execute_buy_works() {
-//         let mut deps = mock_dependencies_custom(&[]);
-//         let env = mock_env();
-//         let info = mock_info("owner", &[]);
-//         let msg = InstantiateMsg {
-//             modules: None,
-//             kernel_address: None,
-//         };
-//         let _res = instantiate(deps.as_mut(), env.clone(), info, msg).unwrap();
-
-//         start_sale(deps.as_mut());
-//         assert_sale_created(deps.as_ref());
-
-//         let msg = ExecuteMsg::Buy {
-//             token_id: MOCK_UNCLAIMED_TOKEN.to_owned(),
-//             token_address: MOCK_TOKEN_ADDR.to_string(),
-//         };
-
-//         let info = mock_info("someone", &coins(100, "uusd".to_string()));
-//         let _res = execute(deps.as_mut(), env, info, msg).unwrap();
-//     }
-
-//     #[test]
-//     fn execute_update_sale_unauthorized() {
-//         let mut deps = mock_dependencies_custom(&[]);
-//         let env = mock_env();
-//         let info = mock_info("owner", &[]);
-//         let msg = InstantiateMsg {
-//             modules: None,
-//             kernel_address: None,
-//         };
-//         let _res = instantiate(deps.as_mut(), env.clone(), info, msg).unwrap();
-
-//         start_sale(deps.as_mut());
-//         assert_sale_created(deps.as_ref());
-
-//         let msg = ExecuteMsg::UpdateSale {
-//             token_id: MOCK_UNCLAIMED_TOKEN.to_owned(),
-//             token_address: MOCK_TOKEN_ADDR.to_string(),
-//             price: Uint128::new(11),
-//             coin_denom: "juno".to_string(),
-//         };
-
-//         let info = mock_info("someone", &[]);
-//         let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
-//         assert_eq!(err, ContractError::Unauthorized {})
-//     }
-
-//     #[test]
-//     fn execute_update_sale_invalid_price() {
-//         let mut deps = mock_dependencies_custom(&[]);
-//         let env = mock_env();
-//         let info = mock_info("owner", &[]);
-//         let msg = InstantiateMsg {
-//             modules: None,
-//             kernel_address: None,
-//         };
-//         let _res = instantiate(deps.as_mut(), env.clone(), info, msg).unwrap();
-
-//         start_sale(deps.as_mut());
-//         assert_sale_created(deps.as_ref());
-
-//         let msg = ExecuteMsg::UpdateSale {
-//             token_id: MOCK_UNCLAIMED_TOKEN.to_owned(),
-//             token_address: MOCK_TOKEN_ADDR.to_string(),
-//             price: Uint128::zero(),
-//             coin_denom: "juno".to_string(),
-//         };
-
-//         let info = mock_info("owner", &[]);
-//         let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
-//         assert_eq!(err, ContractError::InvalidZeroAmount {})
-//     }
-
-//     #[test]
-//     fn execute_start_sale_invalid_price() {
-//         let mut deps = mock_dependencies_custom(&[]);
-//         let env = mock_env();
-//         let info = mock_info("owner", &[]);
-//         let msg = InstantiateMsg {
-//             modules: None,
-//             kernel_address: None,
-//         };
-//         let _res = instantiate(deps.as_mut(), env, info, msg).unwrap();
-
-//         let hook_msg = Cw721HookMsg::StartSale {
-//             coin_denom: "uusd".to_string(),
-//             price: Uint128::zero(),
-//         };
-//         let msg = ExecuteMsg::ReceiveNft(Cw721ReceiveMsg {
-//             sender: MOCK_TOKEN_OWNER.to_owned(),
-//             token_id: MOCK_UNCLAIMED_TOKEN.to_owned(),
-//             msg: encode_binary(&hook_msg).unwrap(),
-//         });
-//         let env = mock_env();
-
-//         let info = mock_info(MOCK_TOKEN_ADDR, &[]);
-//         let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
-//         assert_eq!(err, ContractError::InvalidZeroAmount {})
-//     }
-
-//     #[test]
-//     fn execute_buy_with_tax_and_royalty_insufficient_funds() {
-//         let mut deps = mock_dependencies_custom(&[]);
-//         let env = mock_env();
-//         let info = mock_info("owner", &[]);
-//         let modules = vec![Module {
-//             module_name: Some(RATES.to_owned()),
-//             address: MOCK_RATES_CONTRACT.to_owned(),
-
-//             is_mutable: false,
-//         }];
-//         let msg = InstantiateMsg {
-//             modules: Some(modules),
-//             kernel_address: None,
-//         };
-//         let _res = instantiate(deps.as_mut(), env, info, msg).unwrap();
-
-//         start_sale(deps.as_mut());
-//         assert_sale_created(deps.as_ref());
-
-//         let msg = ExecuteMsg::Buy {
-//             token_id: MOCK_UNCLAIMED_TOKEN.to_owned(),
-//             token_address: MOCK_TOKEN_ADDR.to_string(),
-//         };
-
-//         let info = mock_info("someone", &coins(100, "uusd".to_string()));
-//         let err = execute(deps.as_mut(), mock_env(), info, msg).unwrap_err();
-//         assert_eq!(err, ContractError::InsufficientFunds {})
-//     }
-
-//     #[test]
-//     fn execute_buy_with_tax_and_royalty_works() {
-//         let mut deps = mock_dependencies_custom(&[]);
-//         let env = mock_env();
-//         let info = mock_info("owner", &[]);
-//         let modules = vec![Module {
-//             module_name: Some(RATES.to_owned()),
-//             address: MOCK_RATES_CONTRACT.to_owned(),
-
-//             is_mutable: false,
-//         }];
-//         let msg = InstantiateMsg {
-//             modules: Some(modules),
-//             kernel_address: None,
-//         };
-//         let _res = instantiate(deps.as_mut(), env, info, msg).unwrap();
-
-//         start_sale(deps.as_mut());
-//         assert_sale_created(deps.as_ref());
-
-//         let msg = ExecuteMsg::Buy {
-//             token_id: MOCK_UNCLAIMED_TOKEN.to_owned(),
-//             token_address: MOCK_TOKEN_ADDR.to_string(),
-//         };
-
-//         let info = mock_info("someone", &coins(150, "uusd".to_string()));
-//         let res = execute(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
-//         let expected: Vec<SubMsg<_>> = vec![
-//             SubMsg::new(CosmosMsg::Bank(BankMsg::Send {
-//                 to_address: "royalty_recipient".to_string(),
-//                 amount: vec![coin(10, "uusd")],
-//             })),
-//             SubMsg::new(CosmosMsg::Bank(BankMsg::Send {
-//                 to_address: "tax_recipient".to_string(),
-//                 amount: vec![coin(50, "uusd")],
-//             })),
-//             SubMsg::new(CosmosMsg::Bank(BankMsg::Send {
-//                 to_address: "owner".to_string(),
-//                 amount: vec![coin(90, "uusd")],
-//             })),
-//             SubMsg::new(CosmosMsg::Wasm(WasmMsg::Execute {
-//                 contract_addr: MOCK_TOKEN_ADDR.to_string(),
-//                 msg: encode_binary(&Cw721ExecuteMsg::TransferNft {
-//                     recipient: info.sender.to_string(),
-//                     token_id: MOCK_UNCLAIMED_TOKEN.to_string(),
-//                 })
-//                 .unwrap(),
-//                 funds: vec![],
-//             })),
-//         ];
-//         assert_eq!(res.messages, expected)
-//     }
-// }

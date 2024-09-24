@@ -1,3 +1,4 @@
+use crate::ado_base::permissioning::LocalPermission;
 use crate::amp::{ADO_DB_KEY, VFS_KEY};
 use crate::error::ContractError;
 use cosmwasm_schema::cw_serde;
@@ -7,7 +8,10 @@ use lazy_static::__Deref;
 use serde::de::DeserializeOwned;
 use std::str::from_utf8;
 
-use super::adodb::{ActionFee, QueryMsg as ADODBQueryMsg};
+#[cfg(feature = "rates")]
+use crate::ado_base::rates::LocalRate;
+
+use super::adodb::{ADOVersion, ActionFee, QueryMsg as ADODBQueryMsg};
 use super::kernel::ChannelInfo;
 
 #[cw_serde]
@@ -55,8 +59,8 @@ impl AOSQuerier {
         code_id: u64,
     ) -> Result<Option<String>, ContractError> {
         let key = AOSQuerier::get_map_storage_key("ado_type", &[code_id.to_string().as_bytes()])?;
-        let ado_type: Option<String> = AOSQuerier::query_storage(querier, adodb_addr, &key)?;
-        Ok(ado_type)
+        let ado_type: Option<ADOVersion> = AOSQuerier::query_storage(querier, adodb_addr, &key)?;
+        Ok(ado_type.map(|v| v.get_type()))
     }
 
     pub fn ado_type_getter_smart(
@@ -65,8 +69,8 @@ impl AOSQuerier {
         code_id: u64,
     ) -> Result<Option<String>, ContractError> {
         let query = ADODBQueryMsg::ADOType { code_id };
-        let ado_type: Option<String> = querier.query_wasm_smart(adodb_addr, &query)?;
-        Ok(ado_type)
+        let ado_type: Option<ADOVersion> = querier.query_wasm_smart(adodb_addr, &query)?;
+        Ok(ado_type.map(|v| v.get_type()))
     }
 
     pub fn ado_publisher_getter(
@@ -206,6 +210,35 @@ impl AOSQuerier {
             AOSQuerier::query_storage(querier, kernel_addr, key.as_str())?;
         match verify {
             Some(chain) => Ok(chain),
+            None => Err(ContractError::InvalidAddress {}),
+        }
+    }
+    /// Queries an actor's permission from the address list contract
+    pub fn get_permission(
+        querier: &QuerierWrapper,
+        contract_addr: &Addr,
+        actor: &str,
+    ) -> Result<LocalPermission, ContractError> {
+        let key = AOSQuerier::get_map_storage_key("permissioning", &[actor.as_bytes()])?;
+        let permission: Option<LocalPermission> =
+            AOSQuerier::query_storage(querier, contract_addr, key.as_str())?;
+        match permission {
+            Some(permission) => Ok(permission),
+            None => Err(ContractError::InvalidAddress {}),
+        }
+    }
+
+    #[cfg(feature = "rates")]
+    /// Queries the rates contract
+    pub fn get_rate(
+        querier: &QuerierWrapper,
+        addr: &Addr,
+        action: &str,
+    ) -> Result<LocalRate, ContractError> {
+        let key = AOSQuerier::get_map_storage_key("rates", &[action.as_bytes()])?;
+        let verify: Option<LocalRate> = AOSQuerier::query_storage(querier, addr, key.as_str())?;
+        match verify {
+            Some(rate) => Ok(rate),
             None => Err(ContractError::InvalidAddress {}),
         }
     }

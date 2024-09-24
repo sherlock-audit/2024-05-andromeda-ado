@@ -1,16 +1,16 @@
 use crate::contract::{execute, instantiate, query};
-use crate::state::{ADDRESS_LIST, IS_INCLUSIVE};
+use crate::state::PERMISSIONS;
 use crate::testing::mock_querier::{mock_dependencies_custom, MOCK_KERNEL_CONTRACT};
 use andromeda_modules::address_list::{
-    ExecuteMsg, IncludesAddressResponse, InstantiateMsg, QueryMsg,
+    ActorPermission, ActorPermissionResponse, ExecuteMsg, IncludesActorResponse, InstantiateMsg,
+    QueryMsg,
 };
-use andromeda_std::ado_base::hooks::AndromedaHook;
-use andromeda_std::ado_contract::ADOContract;
+use andromeda_std::ado_base::permissioning::LocalPermission;
 
-use andromeda_std::common::encode_binary;
+use andromeda_std::amp::AndrAddr;
 use andromeda_std::error::ContractError;
 
-use cosmwasm_std::{attr, from_json, DepsMut, MessageInfo, StdError};
+use cosmwasm_std::{attr, from_json, Addr, DepsMut, MessageInfo};
 use cosmwasm_std::{
     testing::{mock_env, mock_info},
     Response,
@@ -22,9 +22,12 @@ fn init(deps: DepsMut, info: MessageInfo) {
         mock_env(),
         info,
         InstantiateMsg {
-            is_inclusive: true,
             kernel_address: MOCK_KERNEL_CONTRACT.to_string(),
             owner: None,
+            actor_permission: Some(ActorPermission {
+                actors: vec![AndrAddr::from_string("actor")],
+                permission: LocalPermission::whitelisted(None),
+            }),
         },
     )
     .unwrap();
@@ -38,245 +41,262 @@ fn test_instantiate() {
     init(deps.as_mut(), info);
 }
 
+// #[test]
+// fn test_instantiate_contract_permission() {
+//     let mut deps = mock_dependencies_custom(&[]);
+//     let info = mock_info("creator", &[]);
+
+//     let err = instantiate(
+//         deps.as_mut(),
+//         mock_env(),
+//         info,
+//         InstantiateMsg {
+//             kernel_address: MOCK_KERNEL_CONTRACT.to_string(),
+//             owner: None,
+//             actor_permission: Some(ActorPermission {
+//                 actor: Addr::unchecked(MOCK_KERNEL_CONTRACT),
+//                 permission: Permission::Whitelisted(None),
+//             }),
+//         },
+//     )
+//     .unwrap_err();
+//     assert_eq!(
+//         err,
+//         ContractError::InvalidPermission {
+//             msg: "Contract permissions aren't allowed in the address list contract".to_string()
+//         }
+//     )
+// }
+
 #[test]
-fn test_add_address() {
+fn test_add_remove_actor() {
     let mut deps = mock_dependencies_custom(&[]);
     let env = mock_env();
 
     let operator = "creator";
     let info = mock_info(operator, &[]);
 
-    let address = "whitelistee";
+    let actor = Addr::unchecked("actor");
+    let permission = LocalPermission::default();
 
     init(deps.as_mut(), info.clone());
 
-    ADOContract::default()
-        .execute_update_operators(deps.as_mut(), info.clone(), vec![operator.to_owned()])
-        .unwrap();
-
-    let msg = ExecuteMsg::AddAddress {
-        address: address.to_string(),
+    let msg = ExecuteMsg::PermissionActors {
+        actors: vec![AndrAddr::from_string(actor.clone())],
+        permission: permission.clone(),
     };
 
-    //add address for registered operator
-
-    let res = execute(deps.as_mut(), env.clone(), info, msg.clone()).unwrap();
+    let res = execute(deps.as_mut(), env.clone(), info.clone(), msg.clone()).unwrap();
     let expected = Response::default().add_attributes(vec![
-        attr("action", "add_address"),
-        attr("address", address),
+        attr("action", "add_actor_permission"),
+        attr("actor", actor.clone()),
+        attr("permission", permission.to_string()),
     ]);
     assert_eq!(expected, res);
 
-    let whitelisted = ADDRESS_LIST.load(deps.as_ref().storage, address).unwrap();
-    assert!(whitelisted);
+    // Check that the actor and permission have been saved.
+    let new_permission = PERMISSIONS.load(deps.as_ref().storage, &actor).unwrap();
+    assert_eq!(new_permission, permission);
 
-    let included = ADDRESS_LIST.load(deps.as_ref().storage, "111").unwrap_err();
-
-    match included {
-        cosmwasm_std::StdError::NotFound { .. } => {}
-        _ => {
-            panic!();
-        }
-    }
-
-    //add address for unregistered operator
+    // Try with unauthorized address
     let unauth_info = mock_info("anyone", &[]);
-    let res = execute(deps.as_mut(), env, unauth_info, msg).unwrap_err();
+    let res = execute(deps.as_mut(), env.clone(), unauth_info, msg).unwrap_err();
     assert_eq!(ContractError::Unauthorized {}, res);
+
+    // // Contract permissions aren't allowed to be saved in the address list contract
+    // let contract_permission = Permission::Whitelisted(None);
+    // let msg = ExecuteMsg::PermissionActors {
+    //     actor: Addr::unchecked(MOCK_KERNEL_CONTRACT),
+    //     permission: contract_permission,
+    // };
+    // let err = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap_err();
+    // assert_eq!(
+    //     err,
+    //     ContractError::InvalidPermission {
+    //         msg: "Contract permissions aren't allowed in the address list contract".to_string()
+    //     }
+    // );
+
+    // Test remove actor
+    let msg = ExecuteMsg::RemovePermissions {
+        actors: vec![AndrAddr::from_string(actor.clone())],
+    };
+    let _res = execute(deps.as_mut(), env.clone(), info.clone(), msg.clone()).unwrap();
+    let permission = PERMISSIONS.may_load(deps.as_ref().storage, &actor).unwrap();
+    assert!(permission.is_none());
+
+    // Try with unauthorized address
+    let unauth_info = mock_info("anyone", &[]);
+    let res = execute(deps.as_mut(), env.clone(), unauth_info, msg).unwrap_err();
+    assert_eq!(ContractError::Unauthorized {}, res);
+
+    // Try removing an actor that isn't included in permissions
+    let random_actor = Addr::unchecked("random_actor");
+    let msg = ExecuteMsg::RemovePermissions {
+        actors: vec![AndrAddr::from_string(random_actor)],
+    };
+    let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
+    assert_eq!(err, ContractError::ActorNotFound {})
 }
 
 #[test]
-fn test_add_addresses() {
+fn test_add_remove_multiple_actors() {
     let mut deps = mock_dependencies_custom(&[]);
     let env = mock_env();
 
     let operator = "creator";
     let info = mock_info(operator, &[]);
 
-    let address = "whitelistee";
-    let address_two = "whitlistee2";
+    let actors = vec![
+        AndrAddr::from_string("actor1"),
+        AndrAddr::from_string("actor2"),
+    ];
+    let permission = LocalPermission::default();
 
     init(deps.as_mut(), info.clone());
 
-    ADOContract::default()
-        .execute_update_operators(deps.as_mut(), info.clone(), vec![operator.to_owned()])
-        .unwrap();
-
-    let msg = ExecuteMsg::AddAddresses { addresses: vec![] };
-
-    //add address for registered operator
-
-    let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap_err();
-    assert_eq!(
-        res,
-        ContractError::Std(StdError::generic_err("addresses cannot be empty"))
-    );
-
-    let addresses = vec![address.to_string(), address_two.to_string()];
-    let msg = ExecuteMsg::AddAddresses {
-        addresses: addresses.clone(),
+    let msg = ExecuteMsg::PermissionActors {
+        actors: actors.clone(),
+        permission: permission.clone(),
     };
 
-    //add address for registered operator
-
-    let res = execute(deps.as_mut(), env.clone(), info, msg.clone()).unwrap();
+    let res = execute(deps.as_mut(), env.clone(), info.clone(), msg.clone()).unwrap();
     let expected = Response::default().add_attributes(vec![
-        attr("action", "add_addresses"),
-        attr("addresses", addresses.join(",")),
+        attr("action", "add_actor_permission"),
+        attr("actor", "actor1, actor2"),
+        attr("permission", permission.to_string()),
     ]);
     assert_eq!(expected, res);
 
-    let whitelisted = ADDRESS_LIST.load(deps.as_ref().storage, address).unwrap();
-    assert!(whitelisted);
-    let whitelisted = ADDRESS_LIST
-        .load(deps.as_ref().storage, address_two)
+    // Check that the actor and permission have been saved.
+    let new_permission = PERMISSIONS
+        .load(
+            deps.as_ref().storage,
+            &actors[0].get_raw_address(&deps.as_ref()).unwrap(),
+        )
         .unwrap();
-    assert!(whitelisted);
+    assert_eq!(new_permission, permission);
+    let new_permission = PERMISSIONS
+        .load(
+            deps.as_ref().storage,
+            &actors[1].get_raw_address(&deps.as_ref()).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(new_permission, permission);
 
-    let included = ADDRESS_LIST.load(deps.as_ref().storage, "111").unwrap_err();
-
-    match included {
-        cosmwasm_std::StdError::NotFound { .. } => {}
-        _ => {
-            panic!();
-        }
-    }
-
-    //add address for unregistered operator
+    // Try with unauthorized address
     let unauth_info = mock_info("anyone", &[]);
-    let res = execute(deps.as_mut(), env, unauth_info, msg).unwrap_err();
+    let res = execute(deps.as_mut(), env.clone(), unauth_info, msg).unwrap_err();
     assert_eq!(ContractError::Unauthorized {}, res);
-}
 
-#[test]
-fn test_remove_address() {
-    let mut deps = mock_dependencies_custom(&[]);
-    let env = mock_env();
+    // // Contract permissions aren't allowed to be saved in the address list contract
+    // let contract_permission = Permission::Whitelisted(None);
+    // let msg = ExecuteMsg::PermissionActors {
+    //     actor: Addr::unchecked(MOCK_KERNEL_CONTRACT),
+    //     permission: contract_permission,
+    // };
+    // let err = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap_err();
+    // assert_eq!(
+    //     err,
+    //     ContractError::InvalidPermission {
+    //         msg: "Contract permissions aren't allowed in the address list contract".to_string()
+    //     }
+    // );
 
-    let operator = "creator";
-    let info = mock_info(operator, &[]);
-
-    let address = "whitelistee";
-
-    init(deps.as_mut(), info.clone());
-
-    //save operator
-    ADOContract::default()
-        .execute_update_operators(deps.as_mut(), info.clone(), vec![operator.to_owned()])
-        .unwrap();
-
-    let msg = ExecuteMsg::RemoveAddress {
-        address: address.to_string(),
+    // Test remove actor
+    let msg = ExecuteMsg::RemovePermissions {
+        actors: actors.clone(),
     };
+    let _res = execute(deps.as_mut(), env.clone(), info.clone(), msg.clone()).unwrap();
+    let permission = PERMISSIONS
+        .may_load(
+            deps.as_ref().storage,
+            &actors[0].get_raw_address(&deps.as_ref()).unwrap(),
+        )
+        .unwrap();
+    assert!(permission.is_none());
+    let permission = PERMISSIONS
+        .may_load(
+            deps.as_ref().storage,
+            &actors[1].get_raw_address(&deps.as_ref()).unwrap(),
+        )
+        .unwrap();
+    assert!(permission.is_none());
 
-    //add address for registered operator
-    let res = execute(deps.as_mut(), env.clone(), info, msg.clone()).unwrap();
-    let expected = Response::default().add_attributes(vec![
-        attr("action", "remove_address"),
-        attr("address", address),
-    ]);
-    assert_eq!(expected, res);
-
-    let included_is_err = ADDRESS_LIST.load(deps.as_ref().storage, address).is_err();
-    assert!(included_is_err);
-
-    //add address for unregistered operator
+    // Try with unauthorized address
     let unauth_info = mock_info("anyone", &[]);
-    let res = execute(deps.as_mut(), env, unauth_info, msg).unwrap_err();
+    let res = execute(deps.as_mut(), env.clone(), unauth_info, msg).unwrap_err();
     assert_eq!(ContractError::Unauthorized {}, res);
-}
 
-#[test]
-fn test_execute_hook_whitelist() {
-    let mut deps = mock_dependencies_custom(&[]);
-    let env = mock_env();
-
-    let operator = "creator";
-    let info = mock_info(operator, &[]);
-
-    let address = "whitelistee";
-
-    // Mark it as a whitelist.
-    IS_INCLUSIVE.save(deps.as_mut().storage, &true).unwrap();
-    init(deps.as_mut(), info.clone());
-
-    let msg = ExecuteMsg::AddAddress {
-        address: address.to_string(),
+    // Try removing an actor that isn't included in permissions
+    let random_actor = Addr::unchecked("random_actor");
+    let msg = ExecuteMsg::RemovePermissions {
+        actors: vec![AndrAddr::from_string(random_actor)],
     };
-    let _res = execute(deps.as_mut(), env, info, msg).unwrap();
-
-    let msg = QueryMsg::AndrHook(AndromedaHook::OnExecute {
-        sender: address.to_string(),
-        payload: encode_binary(&"".to_string()).unwrap(),
-    });
-
-    let res: Option<Response> = from_json(query(deps.as_ref(), mock_env(), msg).unwrap()).unwrap();
-    assert_eq!(None, res);
-
-    let msg = QueryMsg::AndrHook(AndromedaHook::OnExecute {
-        sender: "random".to_string(),
-        payload: encode_binary(&"".to_string()).unwrap(),
-    });
-
-    let res_err: ContractError = query(deps.as_ref(), mock_env(), msg).unwrap_err();
-    assert_eq!(ContractError::Unauthorized {}, res_err);
+    let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
+    assert_eq!(err, ContractError::ActorNotFound {})
 }
 
 #[test]
-fn test_execute_hook_blacklist() {
+fn test_includes_actor_query() {
     let mut deps = mock_dependencies_custom(&[]);
-    let env = mock_env();
 
-    let operator = "creator";
-    let info = mock_info(operator, &[]);
+    let actor = Addr::unchecked("actor");
+    let random_actor = Addr::unchecked("random_actor");
 
-    let address = "blacklistee";
-    init(deps.as_mut(), info.clone());
+    let permission = LocalPermission::default();
 
-    // Mark it as a blacklist.
-    IS_INCLUSIVE.save(deps.as_mut().storage, &false).unwrap();
-    ADOContract::default()
-        .execute_update_operators(deps.as_mut(), info.clone(), vec![operator.to_owned()])
+    PERMISSIONS
+        .save(deps.as_mut().storage, &actor, &permission)
         .unwrap();
 
-    let msg = ExecuteMsg::AddAddress {
-        address: address.to_string(),
-    };
-    let _res = execute(deps.as_mut(), env, info, msg).unwrap();
+    let msg = QueryMsg::IncludesActor { actor };
 
-    let msg = QueryMsg::AndrHook(AndromedaHook::OnExecute {
-        sender: "random".to_string(),
-        payload: encode_binary(&"".to_string()).unwrap(),
-    });
-
-    let res: Option<Response> = from_json(query(deps.as_ref(), mock_env(), msg).unwrap()).unwrap();
-    assert_eq!(None, res);
-
-    let msg = QueryMsg::AndrHook(AndromedaHook::OnExecute {
-        sender: address.to_string(),
-        payload: encode_binary(&"".to_string()).unwrap(),
-    });
-
-    let res_err: ContractError = query(deps.as_ref(), mock_env(), msg).unwrap_err();
-    assert_eq!(ContractError::Unauthorized {}, res_err);
-}
-
-#[test]
-fn test_andr_get_query() {
-    let mut deps = mock_dependencies_custom(&[]);
-
-    let address = "whitelistee";
-
-    ADDRESS_LIST
-        .save(deps.as_mut().storage, address, &true)
-        .unwrap();
-
-    let msg = QueryMsg::IncludesAddress {
-        address: address.to_owned(),
-    };
-
-    let res: IncludesAddressResponse =
+    let res: IncludesActorResponse =
         from_json(query(deps.as_ref(), mock_env(), msg).unwrap()).unwrap();
 
-    assert_eq!(IncludesAddressResponse { included: true }, res);
+    assert_eq!(IncludesActorResponse { included: true }, res);
+
+    let msg = QueryMsg::IncludesActor {
+        actor: random_actor,
+    };
+
+    let res: IncludesActorResponse =
+        from_json(query(deps.as_ref(), mock_env(), msg).unwrap()).unwrap();
+
+    assert_eq!(IncludesActorResponse { included: false }, res);
+}
+
+#[test]
+fn test_actor_permission_query() {
+    let mut deps = mock_dependencies_custom(&[]);
+
+    let actor = Addr::unchecked("actor");
+    let random_actor = Addr::unchecked("random_actor");
+
+    let permission = LocalPermission::default();
+
+    PERMISSIONS
+        .save(deps.as_mut().storage, &actor, &permission)
+        .unwrap();
+
+    let msg = QueryMsg::ActorPermission { actor };
+
+    let res: ActorPermissionResponse =
+        from_json(query(deps.as_ref(), mock_env(), msg).unwrap()).unwrap();
+
+    assert_eq!(
+        ActorPermissionResponse {
+            permission: LocalPermission::default()
+        },
+        res
+    );
+
+    // Try querying for an actor that isn't in permissions
+    let msg = QueryMsg::ActorPermission {
+        actor: random_actor,
+    };
+
+    let err = query(deps.as_ref(), mock_env(), msg).unwrap_err();
+    assert_eq!(err, ContractError::ActorNotFound {});
 }
